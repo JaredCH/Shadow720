@@ -67,6 +67,17 @@ if (-not $SkipAndroid) {
     $env:CFLAGS_aarch64_linux_android = '--target=aarch64-linux-android26'
     $env:AR_aarch64_linux_android = Join-Path $toolchain 'llvm-ar.exe'
 
+    # The Tauri CLI normally writes the resolved config into the APK's assets.
+    # Building through Gradle directly skips that, and the notification plugin
+    # reads it at startup via PluginManager.loadConfig, so without this file the
+    # app throws during launch and closes immediately.
+    $assetDir = Join-Path $root 'src-tauri\gen\android\app\src\main\assets'
+    New-Item -ItemType Directory -Force -Path $assetDir | Out-Null
+    $config = Get-Content (Join-Path $root 'src-tauri\tauri.conf.json') -Raw | ConvertFrom-Json
+    $config | ConvertTo-Json -Depth 32 -Compress |
+        Set-Content -Path (Join-Path $assetDir 'tauri.conf.json') -NoNewline -Encoding utf8
+    Write-Host "  staged assets/tauri.conf.json"
+
     Push-Location (Join-Path $root 'src-tauri')
     try {
         cargo build --release --target aarch64-linux-android

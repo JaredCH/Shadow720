@@ -79,6 +79,11 @@ use std::sync::Arc;
 ///
 /// The Android implementation lives in `keystore_android` and is compiled only for
 /// that target, so this crate builds cleanly on a host without any mobile tooling.
+///
+/// The attribute is what emits the `start_app` JNI entry point Android calls. Without
+/// it the shared library exports no entry point at all, so the app launches and closes
+/// immediately with nothing in the log to explain why.
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_os::init())
