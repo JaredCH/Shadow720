@@ -1,0 +1,64 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  overscroll-behavior: none;
+}
+
+body {
+  /* Prevent the webview from selecting text during drag gestures on the map. */
+  -webkit-user-select: none;
+  user-select: none;
+  background-color: #0b1020;
+}
+
+/* Inputs must stay selectable for copy/paste of invite strings. */
+input,
+textarea {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-3
+      text-sm font-semibold transition-colors disabled:cursor-not-allowed
+      disabled:opacity-40;
+  }
+
+  .btn-primary {
+    @apply btn bg-accent text-white hover:bg-accent-muted;
+  }
+
+  .btn-secondary {
+    @apply btn border border-surface-border bg-surface-raised text-slate-200
+      hover:border-accent;
+  }
+
+  .btn-danger {
+    @apply btn border border-red-800 bg-red-950 text-red-200 hover:bg-red-900;
+  }
+
+  .card {
+    @apply rounded-2xl border border-surface-border bg-surface-raised p-4;
+  }
+
+  .field {
+    @apply w-full rounded-xl border border-surface-border bg-surface px-3 py-3
+      text-sm text-slate-100 placeholder:text-slate-500
+      focus:border-accent focus:outline-none;
+  }
+
+  .label {
+    @apply mb-1 block text-xs font-medium uppercase tracking-wide text-slate-400;
+  }
+
+  .pill {
+      @apply inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs;
+    }
+  }

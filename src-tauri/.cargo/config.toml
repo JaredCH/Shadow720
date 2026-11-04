@@ -1,0 +1,24 @@
+# Android cross-compilation settings.
+#
+# The `tauri android build` command sets these up automatically. They are declared
+# here so the library can also be built directly with `cargo build --target
+# aarch64-linux-android`, which matters on Windows where Tauri's symlink step needs
+# Developer Mode (see README.md).
+#
+# The NDK ships one wrapper per API level; these are pinned to 26 to match
+# `minSdkVersion`. Using a wrapper above the minimum would silently raise it.
+#
+# The NDK toolchain directory must be on PATH for these names to resolve:
+#   $env:PATH = "$env:NDK_HOME\toolchains\llvm\prebuilt\windows-x86_64\bin;$env:PATH"
+
+[target.aarch64-linux-android]
+linker = "aarch64-linux-android26-clang.cmd"
+
+[target.armv7-linux-androideabi]
+linker = "armv7a-linux-androideabi26-clang.cmd"
+
+[target.i686-linux-android]
+linker = "i686-linux-android26-clang.cmd"
+
+[target.x86_64-linux-android]
+linker = "x86_64-linux-android26-clang.cmd"

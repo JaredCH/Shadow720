@@ -1,0 +1,81 @@
+[package]
+name = "shadow720"
+version = "0.1.0"
+description = "Serverless E2EE Android group app - GitHub Issues/Releases as an untrusted ciphertext store"
+authors = ["Shadow720"]
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+
+[lib]
+name = "shadow720_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-store = "2"
+tauri-plugin-os = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-geolocation = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "gzip",
+    "stream",
+    "http2",
+] }
+tokio = { version = "1", features = ["sync", "time", "macros", "rt-multi-thread"] }
+futures-util = "0.3"
+url = "2"
+
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+argon2 = { version = "0.5", features = ["std"] }
+zeroize = { version = "1", features = ["derive"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+subtle = "2"
+sha2 = "0.10"
+
+dashmap = "6"
+zstd = "0.13"
+base64 = "0.22"
+hex = "0.4"
+uuid = { version = "1", features = ["v4"] }
+parking_lot = "0.12"
+log = "0.4"
+secp256k1 = { version = "0.33.1", features = ["rand", "global-context"] }
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
+getrandom = "0.4.3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[features]
+# Enables the live `jaredch` integration suite. Requires SHADOWTEST_PAT + SHADOWTEST_REPO.
+live-tests = []
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

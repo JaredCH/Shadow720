@@ -1,0 +1,15 @@
+<resources>
+    <string name="app_name">"Shadow720"</string>
+    <string name="main_activity_title">"Shadow720"</string>
+
+    <!--
+      Foreground-service notification. The location policy requires that the user
+      can always see that background sharing is running and can stop it, so this
+      text is a compliance artefact rather than a copy detail.
+    -->
+    <string name="location_channel_name">"Location sharing"</string>
+    <string name="location_channel_description">"Shows when your position is being shared with your group, including while the screen is off."</string>
+    <string name="location_notification_title">"Sharing location with your group"</string>
+    <string name="location_notification_text">"Your position is encrypted on this device before it is shared. Tap Stop to end it."</string>
+    <string name="location_notification_stop">"Stop sharing"</string>
+</resources>

@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+/sdks/
+
+# Build output
+dist/
+dist-ssr/
+target/
+*.local
+
+# Tauri / Android generated
+src-tauri/gen/android/.gradle/
+src-tauri/gen/android/**/build/
+src-tauri/gen/android/local.properties
+src-tauri/gen/android/app/.cxx/
+src-tauri/gen/android/.idea/
+*.keystore
+*.jks
+keystore.properties
+
+# Rust
+src-tauri/target/
+
+# Secrets — never commit these
+.env
+.env.*
+!.env.example
+*.pat
+*.pem
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+# Release artifacts and signing material
+release/
+src-tauri/gen/android/*.jks
+src-tauri/gen/android/keystore.properties
+src-tauri/gen/android/app/src/main/jniLibs/
