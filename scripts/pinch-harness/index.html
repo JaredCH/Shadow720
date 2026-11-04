@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>PeerMap pinch harness</title>
+    <style>
+      /*
+        The harness does not run Tailwind, so it reproduces the two rules the map
+        depends on: a bounded height, and touch-action: none so the browser does
+        not claim the pinch before the component sees it.
+      */
+      html, body, #root { height: 100%; margin: 0; background: #0b1020; }
+      #root > div { height: 100%; width: 100%; }
+      #root div { position: relative; height: 100%; width: 100%; touch-action: none; }
+      canvas { display: block; height: 100%; width: 100%; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./main.tsx"></script>
+  </body>
+</html>

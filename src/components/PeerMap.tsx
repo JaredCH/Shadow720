@@ -60,6 +60,14 @@ export function PeerMap({
     lastX: 0,
     lastY: 0,
     movedDuringDrag: false,
+    /** Every pointer currently down, so a second finger can start a pinch. */
+    pointers: new Map<number, { x: number; y: number }>(),
+    /** Finger separation when the current pinch began, in CSS pixels. */
+    pinchDistance: 0,
+    /** Zoom when the current pinch began. */
+    pinchZoom: 0,
+    /** Map point under the pinch midpoint, held fixed while the fingers move. */
+    pinchAnchor: null as { lon: number; lat: number } | null,
   });
   /** Decoded tiles, keyed by `z/x/y`, so a redraw does not refetch. */
   const tileCache = useRef(new Map<string, HTMLImageElement>());
@@ -105,6 +113,11 @@ export function PeerMap({
 
       const cssWidth = rect.width;
       const cssHeight = rect.height;
+
+      // Exposed for the gesture harness in scripts/pinch-harness, which drives
+      // real touch events and needs to assert on the resulting zoom.
+      (canvas as HTMLCanvasElement & { dataset: DOMStringMap }).dataset.zoom =
+        state.zoom.toFixed(3);
 
       // Fractional zoom keeps wheel and pinch smooth; tiles only exist at integer
       // levels, so the nearest one is scaled to fit.
@@ -306,21 +319,101 @@ export function PeerMap({
 
   // -- pointer interaction --------------------------------------------------
 
+  /** The two pointers driving a pinch, or `null` when fewer than two are down. */
+  const pinchPair = (): [{ x: number; y: number }, { x: number; y: number }] | null => {
+    const pointers = [...stateRef.current.pointers.values()];
+    const [first, second] = pointers;
+    if (!first || !second) return null;
+    return [first, second];
+  };
+
+  /** Convert a client-space point into a lon/lat under the current viewport. */
+  const pointToLonLat = (clientX: number, clientY: number) => {
+    const container = containerRef.current;
+    if (!container) return null;
+    const rect = container.getBoundingClientRect();
+    const state = stateRef.current;
+    const tileZoom = Math.round(state.zoom);
+    const scale = 2 ** (state.zoom - tileZoom);
+    const left = lonToWorldX(state.centreLon, tileZoom) - rect.width / 2 / scale;
+    const top = latToWorldY(state.centreLat, tileZoom) - rect.height / 2 / scale;
+
+    return {
+      lon: worldXToLon(left + (clientX - rect.left) / scale, tileZoom),
+      lat: worldYToLat(top + (clientY - rect.top) / scale, tileZoom),
+    };
+  };
+
   const handlePointerDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
     const state = stateRef.current;
+    state.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    event.currentTarget.setPointerCapture(event.pointerId);
+
+    const pair = pinchPair();
+    if (pair) {
+      // A second finger turns the drag into a pinch. The map point under the
+      // midpoint stays put, so the map zooms around the fingers rather than
+      // around the centre of the screen.
+      state.dragging = false;
+      state.movedDuringDrag = true;
+      state.pinchDistance = Math.hypot(pair[0].x - pair[1].x, pair[0].y - pair[1].y);
+      state.pinchZoom = state.zoom;
+      state.pinchAnchor = pointToLonLat(
+        (pair[0].x + pair[1].x) / 2,
+        (pair[0].y + pair[1].y) / 2,
+      );
+      return;
+    }
+
     state.dragging = true;
     state.movedDuringDrag = false;
     state.lastX = event.clientX;
     state.lastY = event.clientY;
-    event.currentTarget.setPointerCapture(event.pointerId);
   };
 
   const handlePointerMove = (event: React.PointerEvent<HTMLCanvasElement>) => {
     const state = stateRef.current;
+    if (!state.pointers.has(event.pointerId)) return;
+    state.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+
+    const pair = pinchPair();
+    if (pair) {
+      const container = containerRef.current;
+      if (!container || state.pinchDistance <= 0) return;
+
+      const distance = Math.hypot(pair[0].x - pair[1].x, pair[0].y - pair[1].y);
+      if (distance <= 0) return;
+
+      // Fingers further apart means a larger scale, which is a higher zoom.
+      const next = clamp(
+        state.pinchZoom + Math.log2(distance / state.pinchDistance),
+        MIN_ZOOM,
+        MAX_ZOOM,
+      );
+      state.zoom = next;
+
+      // Re-centre so the anchored point stays under the midpoint, which also
+      // makes a two-finger drag pan while it zooms.
+      const anchor = state.pinchAnchor;
+      if (anchor) {
+        const rect = container.getBoundingClientRect();
+        const tileZoom = Math.round(next);
+        const scale = 2 ** (next - tileZoom);
+        const midX = (pair[0].x + pair[1].x) / 2 - rect.left;
+        const midY = (pair[0].y + pair[1].y) / 2 - rect.top;
+
+        const centreX = lonToWorldX(anchor.lon, tileZoom) - (midX - rect.width / 2) / scale;
+        const centreY = latToWorldY(anchor.lat, tileZoom) - (midY - rect.height / 2) / scale;
+        state.centreLon = worldXToLon(centreX, tileZoom);
+        state.centreLat = worldYToLat(centreY, tileZoom);
+      }
+
+      renderRef.current();
+      return;
+    }
+
     if (!state.dragging) return;
 
-    const container = containerRef.current;
-    if (!container) return;
     const tileZoom = Math.round(state.zoom);
     const scale = 2 ** (state.zoom - tileZoom);
 
@@ -342,11 +435,41 @@ export function PeerMap({
 
   const handlePointerUp = (event: React.PointerEvent<HTMLCanvasElement>) => {
     const state = stateRef.current;
-    state.dragging = false;
+    const wasPinching = state.pointers.size > 1;
+    state.pointers.delete(event.pointerId);
 
+    // Lifting one finger of a pinch must not be read as a tap on a pin, and the
+    // remaining finger must not jump the map by the distance it moved.
+    if (wasPinching) {
+      state.pinchAnchor = null;
+      state.pinchDistance = 0;
+      const remaining = [...state.pointers.values()][0];
+      if (remaining) {
+        // Hand the gesture back to the surviving finger so the map keeps
+        // panning instead of freezing until it is lifted and pressed again.
+        state.dragging = true;
+        state.movedDuringDrag = true;
+        state.lastX = remaining.x;
+        state.lastY = remaining.y;
+      } else {
+        state.dragging = false;
+      }
+      return;
+    }
+
+    state.dragging = false;
     if (!state.movedDuringDrag) {
       onSelect(hitTest(event));
     }
+  };
+
+  /** A cancelled pointer must not be treated as a tap. */
+  const handlePointerCancel = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    const state = stateRef.current;
+    state.pointers.delete(event.pointerId);
+    state.dragging = false;
+    state.pinchAnchor = null;
+    state.pinchDistance = 0;
   };
 
   const hitTest = (event: React.PointerEvent<HTMLCanvasElement>): string | null => {
@@ -385,7 +508,7 @@ export function PeerMap({
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
-        onPointerCancel={handlePointerUp}
+        onPointerCancel={handlePointerCancel}
         onDoubleClick={handleDoubleClick}
       />
       <a

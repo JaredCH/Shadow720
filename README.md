@@ -92,13 +92,13 @@ The Android APK is signed with a self-signed key, so Android will ask you to all
 
 ```bash
 # Debian / Ubuntu / Mint
-sudo apt install ./Shadow720_0.1.4_amd64.deb
+sudo apt install ./Shadow720_0.1.5_amd64.deb
 
 # Fedora / RHEL / Rocky / Alma
-sudo dnf install ./Shadow720-0.1.4-1.x86_64.rpm
+sudo dnf install ./Shadow720-0.1.5-1.x86_64.rpm
 
 # Any distro, no install
-chmod +x Shadow720_0.1.4_amd64.AppImage && ./Shadow720_0.1.4_amd64.AppImage
+chmod +x Shadow720_0.1.5_amd64.AppImage && ./Shadow720_0.1.5_amd64.AppImage
 ```
 
 The Linux build needs WebKitGTK 4.1 (`libwebkit2gtk-4.1-0`), which the `.deb` and `.rpm` pull in automatically. The AppImage bundles it.
@@ -331,6 +331,16 @@ npm run test:rust     # 415 tests
 npm run lint:rust     # clippy, warnings denied
 npm run typecheck
 ```
+
+The map's touch gestures are covered by a browser test, because a canvas with its own gesture model cannot be exercised from a unit test. It drives real CDP touch events at a mobile viewport and asserts that a pinch out zooms in, a pinch in zooms out, and the zoom clamps:
+
+```powershell
+npm i -D playwright; npx playwright install chromium   # once
+npx vite --config scripts/pinch-harness/vite.config.ts # in one shell
+npm run test:pinch                                     # in another
+```
+
+The harness in `scripts/pinch-harness` mounts `PeerMap` on its own, because the full app cannot reach the map without the Tauri runtime — the vault has to open first.
 
 ### Frontend
 
