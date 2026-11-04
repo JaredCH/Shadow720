@@ -367,10 +367,21 @@ export default function App() {
     // gate has already collected by the time we reach here.
     void (async () => {
       const state = await locationPermissionState();
+      if (state === "system-disabled") {
+        showLocationFailure("system-disabled");
+        return;
+      }
       if (state !== "granted") {
         const granted = await requestLocationPermission();
         if (!granted) {
-          showLocationFailure("permission-denied");
+          const after = await locationPermissionState();
+          if (after === "granted") {
+            void tick();
+            return;
+          }
+          showLocationFailure(
+            after === "system-disabled" ? "system-disabled" : "permission-denied",
+          );
           return;
         }
       }
@@ -395,13 +406,15 @@ export default function App() {
         if (state === "granted") {
           setLocationNotice(null);
           void pushFix();
+        } else if (state === "system-disabled") {
+          showLocationFailure("system-disabled");
         }
       })();
     };
 
     document.addEventListener("visibilitychange", onVisible);
     return () => document.removeEventListener("visibilitychange", onVisible);
-  }, [phase, locationNotice, pushFix]);
+  }, [phase, locationNotice, pushFix, showLocationFailure]);
 
   // -- rotation check --------------------------------------------------------
 
@@ -633,7 +646,12 @@ export default function App() {
           // Background sharing only makes sense with a granted permission; ask now
           // rather than letting the service fail silently.
           const granted = await requestLocationPermission();
-          if (!granted) showLocationFailure("permission-denied");
+          if (!granted) {
+            const state = await locationPermissionState();
+            showLocationFailure(
+              state === "system-disabled" ? "system-disabled" : "permission-denied",
+            );
+          }
         }
       } catch (thrown) {
         setBanner(api.toAppError(thrown));
@@ -793,7 +811,7 @@ export default function App() {
   return (
     <Shell>
       <div className="flex h-full flex-col">
-        <header className="flex items-center justify-between gap-3 border-b border-surface-border px-4 py-3">
+        <header className="flex items-center justify-between gap-3 border-b border-surface-border px-4 pb-3 pt-[max(0.75rem,env(safe-area-inset-top))]">
           <div className="min-w-0">
             <button
               type="button"
@@ -915,7 +933,7 @@ export default function App() {
           ) : null}
         </main>
 
-        <nav className="grid grid-cols-3 border-t border-surface-border">
+        <nav className="grid grid-cols-3 border-t border-surface-border pb-[env(safe-area-inset-bottom)]">
           {(["map", "chat", "settings"] as const).map((option) => (
             <button
               key={option}

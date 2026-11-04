@@ -421,13 +421,18 @@ export function SettingsPanel({
                 {locationIssue.actionLabel}
               </button>
             </div>
-          ) : null}
+          ) : (
+            <p className="text-xs text-slate-400">
+              This device can share its position while the app is open. The button
+              below only controls updates after you leave the app.
+            </p>
+          )}
           <button
             type="button"
             className={backgroundEnabled ? "btn-secondary w-full text-xs" : "btn-primary w-full text-xs"}
             onClick={() => void onToggleBackground()}
           >
-            {backgroundEnabled ? "Stop background sharing" : "Enable background sharing"}
+            {backgroundEnabled ? "Stop background sharing" : "Keep sharing when the app is closed"}
           </button>
           <p className="text-[10px] text-slate-500">
             Turning this off does not leave the group; it only stops position updates

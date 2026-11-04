@@ -55,10 +55,26 @@ interface PluginPosition {
   };
 }
 
+/** What the geolocation plugin actually returns. It is not a bare string. */
+interface PluginPermissionStatus {
+  /** Fine + coarse. Denied when the user picked approximate location only. */
+  location?: string;
+  /** Coarse only. Enough to put a pin on the map. */
+  coarseLocation?: string;
+}
+
+type PluginPermission =
+  | "granted"
+  | "denied"
+  | "prompt"
+  | "prompt-with-rationale";
+
 async function loadPlugin(): Promise<
   | {
-      checkPermissions: () => Promise<string>;
-      requestPermissions: () => Promise<string>;
+      checkPermissions: () => Promise<PluginPermissionStatus>;
+      requestPermissions: (
+        permissions: Array<"location" | "coarseLocation"> | null,
+      ) => Promise<PluginPermissionStatus>;
       getCurrentPosition: (options: {
         enableHighAccuracy: boolean;
         timeout: number;
@@ -76,8 +92,10 @@ async function loadPlugin(): Promise<
   try {
     const module = await import("@tauri-apps/plugin-geolocation");
     return module as unknown as {
-      checkPermissions: () => Promise<string>;
-      requestPermissions: () => Promise<string>;
+      checkPermissions: () => Promise<PluginPermissionStatus>;
+      requestPermissions: (
+        permissions: Array<"location" | "coarseLocation"> | null,
+      ) => Promise<PluginPermissionStatus>;
       getCurrentPosition: (options: {
         enableHighAccuracy: boolean;
         timeout: number;
@@ -87,6 +105,37 @@ async function loadPlugin(): Promise<
   } catch {
     return null;
   }
+}
+
+/**
+ * Collapse the plugin's permission object into one state.
+ *
+ * Comparing the object to `"granted"` is always false, which made a successful
+ * prompt look like a denial and stopped the map from ever reading a fix.
+ * Approximate location grants only `coarseLocation`, and that is still a fix.
+ */
+function summarizePermission(value: unknown): PluginPermission | null {
+  if (typeof value === "string") {
+    return value === "granted" ||
+      value === "denied" ||
+      value === "prompt" ||
+      value === "prompt-with-rationale"
+      ? value
+      : null;
+  }
+  if (!value || typeof value !== "object") return null;
+  const status = value as PluginPermissionStatus;
+  const states = [status.location, status.coarseLocation];
+  if (states.includes("granted")) return "granted";
+  if (states.includes("prompt-with-rationale")) return "prompt-with-rationale";
+  if (states.includes("prompt")) return "prompt";
+  if (states.includes("denied")) return "denied";
+  return null;
+}
+
+function isLocationServicesDisabled(error: unknown): boolean {
+  const detail = error instanceof Error ? error.message : String(error);
+  return /location services are disabled|location is turned off/i.test(detail);
 }
 
 /** Cached platform check, so the OS plugin is queried at most once. */
@@ -116,7 +165,12 @@ async function isAndroid(): Promise<boolean> {
  * bridge and the browser API cannot report it.
  */
 export async function locationPermissionState(): Promise<
-  "granted" | "denied" | "prompt" | "prompt-with-rationale" | "runtime-unavailable"
+  | "granted"
+  | "denied"
+  | "prompt"
+  | "prompt-with-rationale"
+  | "system-disabled"
+  | "runtime-unavailable"
 > {
   const plugin = await loadPlugin();
   if (!plugin) {
@@ -124,10 +178,9 @@ export async function locationPermissionState(): Promise<
     return "runtime-unavailable";
   }
   try {
-    const state = await plugin.checkPermissions();
-    if (state === "granted" || state === "denied" || state === "prompt") return state;
-    return "prompt-with-rationale";
-  } catch {
+    return summarizePermission(await plugin.checkPermissions()) ?? "prompt";
+  } catch (error) {
+    if (isLocationServicesDisabled(error)) return "system-disabled";
     return "runtime-unavailable";
   }
 }
@@ -142,8 +195,11 @@ export async function requestLocationPermission(): Promise<boolean> {
   const plugin = await loadPlugin();
   if (!plugin) return true; // The browser prompt happens on first read instead.
   try {
-    const state = await plugin.requestPermissions();
-    return state === "granted";
+    // `location` covers both fine and coarse. Do not request background here:
+    // "ask every time" is a valid foreground grant, and background is a separate
+    // settings action.
+    const state = await plugin.requestPermissions(["location"]);
+    return summarizePermission(state) === "granted";
   } catch {
     return false;
   }
@@ -171,6 +227,9 @@ export async function currentPosition(): Promise<LocationResult> {
       };
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
+      if (isLocationServicesDisabled(error)) {
+        return { failure: "system-disabled", detail };
+      }
       // The plugin reports refusals in prose rather than a code, so the message
       // is the only signal available.
       if (/denied|not allowed|permission/i.test(detail)) {
