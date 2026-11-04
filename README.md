@@ -11,7 +11,7 @@
 [![Rust](https://img.shields.io/badge/Rust-415%20tests%20passing-000?logo=rust&logoColor=white)](./src-tauri)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-24C8DB?logo=tauri&logoColor=white)](https://v2.tauri.app)
 [![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](./src)
-[![Platforms](https://img.shields.io/badge/Windows%20%7C%20Android-ready-5b8cff)](#download)
+[![Platforms](https://img.shields.io/badge/Windows%20%7C%20Android%20%7C%20Linux-ready-5b8cff)](#download)
 [![License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
 [Download](#download) · [What it does](#what-it-does) · [Security](#security-model) · [Build it](#building) · [Limitations](#known-limitations)
@@ -82,8 +82,30 @@ Prebuilt packages are attached to each [release](../../releases):
 |---|---|---|
 | Windows | `Shadow720_<version>_x64-setup.exe` | Installer; also `.msi` |
 | Android | `Shadow720_<version>_arm64.apk` | Android 8.0+ (API 26), arm64 |
+| Linux (Debian/Ubuntu) | `Shadow720_<version>_amd64.deb` | Ubuntu 22.04+, Debian 12+, Linux Mint 21+ |
+| Linux (Fedora/RHEL) | `Shadow720-<version>-1.x86_64.rpm` | Fedora 35+, RHEL/Rocky/Alma 9+ |
+| Linux (any distro) | `Shadow720_<version>_amd64.AppImage` | No install; `chmod +x` and run |
 
 The Android APK is signed with a self-signed key, so Android will ask you to allow installing from an unknown source. That is expected for an app distributed outside Play.
+
+**Installing on Linux**
+
+```bash
+# Debian / Ubuntu / Mint
+sudo apt install ./Shadow720_0.1.4_amd64.deb
+
+# Fedora / RHEL / Rocky / Alma
+sudo dnf install ./Shadow720-0.1.4-1.x86_64.rpm
+
+# Any distro, no install
+chmod +x Shadow720_0.1.4_amd64.AppImage && ./Shadow720_0.1.4_amd64.AppImage
+```
+
+The Linux build needs WebKitGTK 4.1 (`libwebkit2gtk-4.1-0`), which the `.deb` and `.rpm` pull in automatically. The AppImage bundles it.
+
+**Where the Linux build keeps its secrets**
+
+The vault password is wrapped by a 32-byte device key. On Linux that key lives in the system keyring (GNOME Keyring or KWallet, via the Secret Service API), so it is protected by your login keyring rather than sitting next to the vault file. If no keyring daemon is running — a headless box, or a minimal window manager — the key falls back to a `0600` file at `~/.local/share/shadow720/device.key`. The choice is recorded once in `~/.local/share/shadow720/keystore-backend` and never revisited, so a keyring appearing later cannot orphan an existing vault. The fallback protects the vault from other users and from copies of the vault file, but not from code already running as you.
 
 ---
 
@@ -342,13 +364,26 @@ Output: `src-tauri/gen/android/app/build/outputs/apk/arm64/debug/app-arm64-debug
 
 ### Release packages
 
-`scripts/build-release.ps1` produces both downloadable artifacts and stages them in `release/`:
+`scripts/build-release.ps1` produces the Windows and Android artifacts and stages them in `release/`:
 
 ```powershell
 .\scripts\build-release.ps1
 ```
 
 It builds the Windows installer with `tauri build`, then the signed Android APK, and copies both into `release/`. The Android signing key is read from `src-tauri/gen/android/keystore.properties`, which is gitignored; without it the APK is unsigned and cannot be installed.
+
+### Linux packages
+
+Linux bundles are built on Linux, not cross-compiled, because the `.deb` and `.rpm` link against the host's WebKitGTK. `scripts/build-release-linux.sh` builds all three and stages them in `release/`:
+
+```bash
+sudo apt install build-essential curl wget file pkg-config libssl-dev \
+  libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev \
+  librsvg2-dev libdbus-1-dev libsecret-1-dev patchelf rpm
+./scripts/build-release-linux.sh
+```
+
+Build on the **oldest** distro you intend to support: the binary records the glibc symbols it needs, so a package built on Ubuntu 24.04 will not install on Ubuntu 22.04. The shipped packages are built on Ubuntu 22.04 (glibc 2.35), which covers Ubuntu 22.04+, Debian 12+, and Fedora 35+.
 
 ---
 

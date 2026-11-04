@@ -119,24 +119,40 @@ pub fn run() {
         builder = builder.manage(keystore);
     }
 
-    #[cfg(all(not(target_os = "android"), not(windows)))]
+    #[cfg(target_os = "linux")]
     {
-        // Desktop fallback: an in-memory keystore, which is deliberately not
-        // persistent across launches. Development builds are expected to re-join
-        // a group rather than keep secrets on disk.
-            match vault::InMemoryKeystore::new() {
-                Ok(keystore) => {
-                    let keystore: Arc<dyn vault::Keystore> = Arc::new(keystore);
-                    builder = builder.manage(keystore);
-                }
-                Err(error) => {
-                    // Without a keystore the app cannot store anything, so this is
-                    // fatal rather than something to limp past.
-                    eprintln!("fatal: could not create the development keystore: {error}");
-                    return;
-                }
+        // The device key lives in the Secret Service, or in a 0600 file when no
+        // keyring daemon is running. Either way it persists across launches, so a
+        // Linux install keeps its vault like the Windows and Android builds do.
+        match vault::LinuxKeystore::new() {
+            Ok(keystore) => {
+                let keystore: Arc<dyn vault::Keystore> = Arc::new(keystore);
+                builder = builder.manage(keystore);
+            }
+            Err(error) => {
+                // Without a keystore the app cannot store anything, so this is
+                // fatal rather than something to limp past.
+                eprintln!("fatal: could not create the Linux keystore: {error}");
+                return;
             }
         }
+    }
+
+    #[cfg(all(not(target_os = "android"), not(windows), not(target_os = "linux")))]
+    {
+        // Remaining desktop targets have no keystore integration yet, so they get
+        // the in-memory double: deliberately not persistent across launches.
+        match vault::InMemoryKeystore::new() {
+            Ok(keystore) => {
+                let keystore: Arc<dyn vault::Keystore> = Arc::new(keystore);
+                builder = builder.manage(keystore);
+            }
+            Err(error) => {
+                eprintln!("fatal: could not create the development keystore: {error}");
+                return;
+            }
+        }
+    }
 
     let result = builder
         .manage(commands::AppState::new())

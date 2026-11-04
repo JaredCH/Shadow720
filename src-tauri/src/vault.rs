@@ -307,6 +307,309 @@ impl Keystore for WindowsKeystore {
     }
 }
 
+/// Length of the Linux device key.
+#[cfg(target_os = "linux")]
+const LINUX_KEY_LEN: usize = 32;
+/// Associated data binding a Linux-wrapped secret to its purpose.
+#[cfg(target_os = "linux")]
+const LINUX_KEY_AAD: &[u8] = b"shadow720/linux/device-key/v1";
+/// Secret Service item identifying the device key.
+#[cfg(target_os = "linux")]
+const LINUX_KEYRING_SERVICE: &str = "com.shadow720.app";
+#[cfg(target_os = "linux")]
+const LINUX_KEYRING_ACCOUNT: &str = "vault-device-key";
+/// Records which backend holds the device key, so it cannot change under a vault.
+#[cfg(target_os = "linux")]
+const LINUX_BACKEND_MARKER: &str = "keystore-backend";
+/// Filename of the fallback device key.
+#[cfg(target_os = "linux")]
+const LINUX_KEY_FILENAME: &str = "device.key";
+
+/// Where the Linux device key lives.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LinuxBackend {
+    /// A Secret Service item, protected by the login keyring.
+    SecretService,
+    /// A `0600` file, used when no Secret Service is reachable.
+    File,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxBackend {
+    fn marker(self) -> &'static str {
+        match self {
+            Self::SecretService => "secret-service",
+            Self::File => "file",
+        }
+    }
+
+    fn from_marker(value: &str) -> Option<Self> {
+        match value.trim() {
+            "secret-service" => Some(Self::SecretService),
+            "file" => Some(Self::File),
+            _ => None,
+        }
+    }
+}
+
+/// Linux device key, held by the Secret Service where one is available.
+///
+/// The key is 32 random bytes that wrap the vault password, so the sealed vault
+/// file is useless without it. Storing it in the Secret Service means it is
+/// protected by the login keyring instead of sitting beside the vault file.
+///
+/// A desktop with no keyring daemon (or a headless host) has no Secret Service,
+/// so the key falls back to a `0600` file in the app data directory. That is
+/// weaker — it protects against other users and offline copies of the vault, but
+/// not against code already running as the user — so the choice is recorded once
+/// and never revisited: a later launch cannot silently switch backends and
+/// orphan an existing vault.
+#[cfg(target_os = "linux")]
+pub struct LinuxKeystore {
+    backend: LinuxBackend,
+    key: Mutex<Option<Zeroizing<[u8; LINUX_KEY_LEN]>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxKeystore {
+    /// Resolve the backend, preferring the Secret Service.
+    pub fn new() -> Result<Self> {
+        let backend = match Self::read_marker()? {
+            Some(recorded) => {
+                // Honour the recorded choice even if the other backend is now
+                // available: switching would change the key and lose the vault.
+                if recorded == LinuxBackend::SecretService && !Self::secret_service_available() {
+                    return Err(AppError::vault(
+                        "this vault's device key is stored in the system keyring, but no Secret \
+                         Service is reachable. Start your keyring daemon (gnome-keyring or KWallet) \
+                         and try again.",
+                    ));
+                }
+                recorded
+            }
+            None => {
+                let chosen = if Self::secret_service_available() {
+                    LinuxBackend::SecretService
+                } else {
+                    LinuxBackend::File
+                };
+                Self::write_marker(chosen)?;
+                chosen
+            }
+        };
+
+        Ok(Self {
+            backend,
+            key: Mutex::new(None),
+        })
+    }
+
+    /// Directory holding the marker and the fallback key.
+    fn data_dir() -> Result<PathBuf> {
+        if let Some(base) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+            return Ok(PathBuf::from(base).join("shadow720"));
+        }
+        let home = std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| AppError::vault("neither XDG_DATA_HOME nor HOME is set"))?;
+        Ok(PathBuf::from(home).join(".local").join("share").join("shadow720"))
+    }
+
+    fn marker_path() -> Result<PathBuf> {
+        Ok(Self::data_dir()?.join(LINUX_BACKEND_MARKER))
+    }
+
+    fn key_path() -> Result<PathBuf> {
+        Ok(Self::data_dir()?.join(LINUX_KEY_FILENAME))
+    }
+
+    fn read_marker() -> Result<Option<LinuxBackend>> {
+        let path = Self::marker_path()?;
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => Ok(LinuxBackend::from_marker(&raw)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(AppError::io(
+                "reading the keystore backend marker",
+                format!("{}: {error}", path.display()),
+            )),
+        }
+    }
+
+    fn write_marker(backend: LinuxBackend) -> Result<()> {
+        let path = Self::marker_path()?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| AppError::io("creating the app data directory", e.to_string()))?;
+        }
+        write_private(&path, backend.marker().as_bytes())
+    }
+
+    /// True when a Secret Service answers on the session bus.
+    fn secret_service_available() -> bool {
+        match keyring::Entry::new(LINUX_KEYRING_SERVICE, LINUX_KEYRING_ACCOUNT) {
+            // `NoEntry` still proves the service answered.
+            Ok(entry) => !matches!(
+                entry.get_secret(),
+                Err(keyring::Error::PlatformFailure(_)) | Err(keyring::Error::NoStorageAccess(_))
+            ),
+            Err(_) => false,
+        }
+    }
+
+    fn load_from_secret_service() -> Result<Option<Zeroizing<[u8; LINUX_KEY_LEN]>>> {
+        let entry = keyring::Entry::new(LINUX_KEYRING_SERVICE, LINUX_KEYRING_ACCOUNT)
+            .map_err(|e| AppError::vault(format!("the system keyring is unavailable: {e}")))?;
+        match entry.get_secret() {
+            Ok(bytes) => {
+                let key: [u8; LINUX_KEY_LEN] = bytes.as_slice().try_into().map_err(|_| {
+                    AppError::vault("the keyring holds a device key of the wrong size")
+                })?;
+                Ok(Some(Zeroizing::new(key)))
+            }
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(AppError::vault(format!(
+                "could not read the device key from the system keyring: {error}"
+            ))),
+        }
+    }
+
+    fn store_in_secret_service(key: &[u8; LINUX_KEY_LEN]) -> Result<()> {
+        let entry = keyring::Entry::new(LINUX_KEYRING_SERVICE, LINUX_KEYRING_ACCOUNT)
+            .map_err(|e| AppError::vault(format!("the system keyring is unavailable: {e}")))?;
+        entry
+            .set_secret(key)
+            .map_err(|e| AppError::vault(format!("could not save the device key to the system keyring: {e}")))
+    }
+
+    fn load_from_file() -> Result<Option<Zeroizing<[u8; LINUX_KEY_LEN]>>> {
+        let path = Self::key_path()?;
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let key: [u8; LINUX_KEY_LEN] = bytes.as_slice().try_into().map_err(|_| {
+                    AppError::vault(format!(
+                        "the device key file {} is not {LINUX_KEY_LEN} bytes",
+                        path.display()
+                    ))
+                })?;
+                Ok(Some(Zeroizing::new(key)))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(AppError::io(
+                "reading the device key file",
+                format!("{}: {error}", path.display()),
+            )),
+        }
+    }
+
+    fn store_in_file(key: &[u8; LINUX_KEY_LEN]) -> Result<()> {
+        let path = Self::key_path()?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| AppError::io("creating the app data directory", e.to_string()))?;
+        }
+        write_private(&path, key)
+    }
+
+    /// The device key, generated and persisted on first use.
+    fn device_key(&self) -> Result<Zeroizing<[u8; LINUX_KEY_LEN]>> {
+        let mut guard = self.key.lock();
+        if let Some(key) = guard.as_ref() {
+            return Ok(Zeroizing::new(**key));
+        }
+
+        let existing = match self.backend {
+            LinuxBackend::SecretService => Self::load_from_secret_service()?,
+            LinuxBackend::File => Self::load_from_file()?,
+        };
+
+        let key = match existing {
+            Some(key) => key,
+            None => {
+                let fresh = Zeroizing::new(random_bytes::<LINUX_KEY_LEN>()?);
+                match self.backend {
+                    LinuxBackend::SecretService => Self::store_in_secret_service(&fresh)?,
+                    LinuxBackend::File => Self::store_in_file(&fresh)?,
+                }
+                fresh
+            }
+        };
+
+        *guard = Some(Zeroizing::new(*key));
+        Ok(key)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for LinuxKeystore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinuxKeystore")
+            .field("backend", &self.backend)
+            .field("has_key", &self.key.lock().is_some())
+            .finish()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Keystore for LinuxKeystore {
+    fn wrap_secret(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let key = self.device_key()?;
+        let nonce = random_bytes::<NONCE_LEN>()?;
+        let sealed = crypto::seal_blob_with(&key, plaintext, nonce, LINUX_KEY_AAD)?;
+
+        // Layout: nonce ‖ ciphertext+tag, matching `crypto::open_blob_with`.
+        let mut out = Vec::with_capacity(NONCE_LEN + sealed.len());
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&sealed);
+        Ok(out)
+    }
+
+    fn unwrap_secret(&self, wrapped: &[u8]) -> Result<Vec<u8>> {
+        let key = self.device_key()?;
+        crypto::open_blob_with(&key, wrapped, LINUX_KEY_AAD).map_err(|_| {
+            AppError::vault(
+                "the vault password could not be unwrapped; the device key changed or the file was modified",
+            )
+        })
+    }
+
+    fn key_alias(&self) -> String {
+        format!("shadow720.linux.{}", self.backend.marker())
+    }
+
+    fn delete_key(&self) -> Result<()> {
+        match self.backend {
+            LinuxBackend::SecretService => {
+                let entry = keyring::Entry::new(LINUX_KEYRING_SERVICE, LINUX_KEYRING_ACCOUNT)
+                    .map_err(|e| AppError::vault(format!("the system keyring is unavailable: {e}")))?;
+                match entry.delete_credential() {
+                    Ok(()) | Err(keyring::Error::NoEntry) => {}
+                    Err(error) => {
+                        return Err(AppError::vault(format!(
+                            "could not delete the device key from the system keyring: {error}"
+                        )))
+                    }
+                }
+            }
+            LinuxBackend::File => {
+                let path = Self::key_path()?;
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(AppError::io(
+                            "deleting the device key file",
+                            format!("{}: {error}", path.display()),
+                        ))
+                    }
+                }
+            }
+        }
+        *self.key.lock() = None;
+        Ok(())
+    }
+}
+
 /// Keystore alias used by the in-memory double.
 const IN_MEMORY_ALIAS: &str = "shadow720.test.in-memory";
 /// Length of the in-memory double's device key.
@@ -1318,6 +1621,139 @@ mod tests {
         let encrypted = first.wrap_secret(b"persistent secret").expect("protect");
         assert_ne!(encrypted, b"persistent secret");
         assert_eq!(second.unwrap_secret(&encrypted).expect("unprotect"), b"persistent secret");
+    }
+
+    // -- LinuxKeystore -------------------------------------------------------
+
+    /// Serializes tests that mutate `XDG_DATA_HOME`, which is process-wide.
+    #[cfg(target_os = "linux")]
+    static DATA_HOME_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Point the keystore at a scratch data directory for the duration of a test.
+    #[cfg(target_os = "linux")]
+    struct ScratchDataHome {
+        dir: PathBuf,
+        previous: Option<std::ffi::OsString>,
+        _guard: parking_lot::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ScratchDataHome {
+        fn new(name: &str) -> Self {
+            let guard = DATA_HOME_LOCK.lock();
+            let dir = scratch(name);
+            let previous = std::env::var_os("XDG_DATA_HOME");
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            Self { dir, previous, _guard: guard }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ScratchDataHome {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A keystore pinned to the file backend, so the test never needs a keyring.
+    #[cfg(target_os = "linux")]
+    fn file_backed_keystore() -> LinuxKeystore {
+        LinuxKeystore {
+            backend: LinuxBackend::File,
+            key: Mutex::new(None),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_keystore_round_trips_and_persists_the_device_key() {
+        let _home = ScratchDataHome::new("linux-keystore-round-trip");
+        let plaintext = [0x5Au8; VAULT_PASSWORD_LEN];
+
+        let wrapped = file_backed_keystore().wrap_secret(&plaintext).expect("wrap");
+        assert_ne!(wrapped.as_slice(), plaintext, "must not be plaintext");
+
+        // A second instance has no in-memory key, so this only succeeds if the
+        // device key was persisted.
+        let reopened = file_backed_keystore();
+        assert_eq!(reopened.unwrap_secret(&wrapped).expect("unwrap"), plaintext.to_vec());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_keystore_writes_the_device_key_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _home = ScratchDataHome::new("linux-keystore-permissions");
+        file_backed_keystore().wrap_secret(b"secret").expect("wrap");
+
+        let path = LinuxKeystore::key_path().expect("key path");
+        let mode = std::fs::metadata(&path).expect("metadata").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "the device key must not be group/world readable");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_keystore_detects_tampering() {
+        let _home = ScratchDataHome::new("linux-keystore-tamper");
+        let keystore = file_backed_keystore();
+        let mut wrapped = keystore.wrap_secret(b"secret").expect("wrap");
+        let index = wrapped.len() - 1;
+        wrapped[index] ^= 0x01;
+        let err = keystore.unwrap_secret(&wrapped).expect_err("must fail");
+        assert_eq!(err.kind(), AppErrorKind::VaultUnavailable);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_keystore_rejects_a_foreign_device_key() {
+        let _home = ScratchDataHome::new("linux-keystore-foreign");
+        let wrapped = file_backed_keystore().wrap_secret(b"secret").expect("wrap");
+
+        // Replace the device key with a different one, as a copied vault would.
+        let path = LinuxKeystore::key_path().expect("key path");
+        std::fs::write(&path, [0x11u8; LINUX_KEY_LEN]).expect("overwrite key");
+
+        assert!(file_backed_keystore().unwrap_secret(&wrapped).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_keystore_delete_key_forgets_the_device_key() {
+        let _home = ScratchDataHome::new("linux-keystore-delete");
+        let keystore = file_backed_keystore();
+        let wrapped = keystore.wrap_secret(b"secret").expect("wrap");
+
+        keystore.delete_key().expect("delete");
+        assert!(!LinuxKeystore::key_path().expect("key path").exists());
+        assert!(keystore.unwrap_secret(&wrapped).is_err(), "the old blob must not open");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_keystore_records_its_backend_once() {
+        let _home = ScratchDataHome::new("linux-keystore-marker");
+        let marker = LinuxKeystore::marker_path().expect("marker path");
+        assert!(!marker.exists());
+
+        LinuxKeystore::write_marker(LinuxBackend::File).expect("write marker");
+        assert_eq!(LinuxKeystore::read_marker().expect("read"), Some(LinuxBackend::File));
+
+        // A recorded backend wins over what is currently available, so a vault
+        // cannot be orphaned by a keyring appearing later.
+        assert_eq!(LinuxBackend::from_marker("secret-service"), Some(LinuxBackend::SecretService));
+        assert_eq!(LinuxBackend::from_marker("nonsense"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_keystore_alias_names_the_backend() {
+        let _home = ScratchDataHome::new("linux-keystore-alias");
+        assert_eq!(file_backed_keystore().key_alias(), "shadow720.linux.file");
     }
 
     // -- InMemoryKeystore ----------------------------------------------------
