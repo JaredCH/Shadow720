@@ -22,6 +22,7 @@ import { ChatDrawer, readFileBytes, saveDecryptedFile } from "./components/ChatD
 import { ConsentGate, InviteDisplay } from "./components/ConsentGate";
 import { ConfirmSheet, ErrorBanner, Field, InfoBanner, Modal, TextArea } from "./components/Modal";
 import { MapPanel } from "./components/MapPanel";
+import { PeopleSheet } from "./components/PeopleSheet";
 import { ProviderPicker, providerById } from "./components/ProviderPicker";
 import type { ProviderId } from "./components/ProviderPicker";
 import { SignInPanel } from "./components/SignInPanel";
@@ -42,6 +43,14 @@ type Tab = "map" | "chat" | "settings";
  * These are only floors, used if a command returns something implausible.
  */
 const MIN_CHAT_DELAY_MS = 2_000;
+
+/**
+ * Build version, shown on the failure screen.
+ *
+ * Without it there is no way to tell which APK is installed, which made a
+ * report of an already-fixed bug indistinguishable from a new one.
+ */
+const APP_VERSION = "0.1.3";
 const MIN_ROSTER_DELAY_MS = 5_000;
 
 /** How often to refresh the local GPS fix while the map tab is visible. */
@@ -69,17 +78,22 @@ export default function App() {
   const [trails, setTrails] = useState<Record<string, api.TrailPoint[]>>({});
   const [groups, setGroups] = useState<api.GroupSummary[]>([]);
   const [showGroups, setShowGroups] = useState(false);
+  const [showAddGroup, setShowAddGroup] = useState(false);
+  const [showPeople, setShowPeople] = useState(false);
+  const [askInvitePassword, setAskInvitePassword] = useState(false);
+  const [invitePassword, setInvitePassword] = useState("");
   const [locationNotice, setLocationNotice] = useState<{
     message: string;
     remedy: LocationRemedy | null;
   } | null>(null);
   const [selectedPubkey, setSelectedPubkey] = useState<string | null>(null);
-
   const [tab, setTab] = useState<Tab>("map");
   const [banner, setBanner] = useState<AppError | null>(null);
-  const [invite, setInvite] = useState<{ value: string; fingerprint: string } | null>(
-    null,
-  );
+  const [invite, setInvite] = useState<{
+    value: string;
+    fingerprint: string;
+    containsToken: boolean;
+  } | null>(null);
   const [rotationPrompt, setRotationPrompt] = useState<api.RotationStatus | null>(null);
   const [backgroundEnabled, setBackgroundEnabled] = useState(false);
   const [reportTarget, setReportTarget] = useState<{
@@ -481,7 +495,12 @@ export default function App() {
     setGroupLabel(input.groupLabel);
     setFingerprint(response.fingerprint);
     setIsHost(true);
-    setInvite({ value: response.invite, fingerprint: response.fingerprint });
+    setInvite({
+      value: response.invite,
+      fingerprint: response.fingerprint,
+      containsToken: true,
+    });
+    setShowAddGroup(false);
 
     if (!response.hasAdminScope) {
       setBanner({
@@ -509,7 +528,12 @@ export default function App() {
     setGroupLabel(input.groupLabel);
     setFingerprint(response.fingerprint);
     setIsHost(true);
-    setInvite({ value: response.invite, fingerprint: response.fingerprint });
+    setInvite({
+      value: response.invite,
+      fingerprint: response.fingerprint,
+      containsToken: false,
+    });
+    setShowAddGroup(false);
 
     await loadGroupState();
     setPhase("ready");
@@ -529,7 +553,47 @@ export default function App() {
       return;
     }
     await loadGroupState();
+    setShowAddGroup(false);
     setPhase("ready");
+  };
+
+  const handleSendText = async (text: string) => {
+    await api.sendText(text);
+    const snapshot = await api.chatSnapshot();
+    setChat(snapshot.items);
+  };
+
+  const openInvite = async () => {
+    try {
+      const stored = await api.currentInvite();
+      if (stored) {
+        setInvite({
+          value: stored,
+          fingerprint,
+          containsToken: !diagnostics?.accountless,
+        });
+        return;
+      }
+      setInvitePassword("");
+      setAskInvitePassword(true);
+    } catch (thrown) {
+      setBanner(api.toAppError(thrown));
+    }
+  };
+
+  const submitShareInvite = async () => {
+    try {
+      const response = await api.shareInvite(invitePassword);
+      setAskInvitePassword(false);
+      setInvitePassword("");
+      setInvite({
+        value: response.invite,
+        fingerprint: response.fingerprint,
+        containsToken: !diagnostics?.accountless,
+      });
+    } catch (thrown) {
+      setBanner(api.toAppError(thrown));
+    }
   };
 
   const handleBlock = async (pubkeyB64: string, shouldBlockNow: boolean) => {
@@ -703,6 +767,9 @@ export default function App() {
           <h1 className="text-lg font-semibold text-slate-100">
             Shadow720 could not start
           </h1>
+          <p className="text-[10px] font-mono text-slate-600">
+            version {APP_VERSION}
+          </p>
           <p className="text-sm text-slate-400">
             {fatalError ? describeError(fatalError) : "An unknown error occurred."}
           </p>
@@ -811,30 +878,45 @@ export default function App() {
   return (
     <Shell>
       <div className="flex h-full flex-col">
-        <header className="flex items-center justify-between gap-3 border-b border-surface-border px-4 pb-3 pt-[max(0.75rem,env(safe-area-inset-top))]">
-          <div className="min-w-0">
-            <button
-              type="button"
-              className="flex min-w-0 items-center gap-1 text-left"
-              onClick={() => setShowGroups(true)}
-              title="Switch group"
-            >
+        <header className="border-b border-surface-border px-4 pb-3 pt-[max(0.75rem,env(safe-area-inset-top))]">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
               <h1 className="truncate text-sm font-semibold text-slate-100">
                 {groupLabel || "Shadow720"}
               </h1>
-              {groups.length > 1 ? (
-                <span className="shrink-0 text-[10px] text-slate-500">▾</span>
-              ) : null}
-            </button>
-            <p className="truncate text-[10px] text-slate-500">
-              {diagnostics?.repoFullName ?? "connected"} · you are{" "}
-              <span className="font-mono">{fingerprint || "—"}</span>
-            </p>
+              <p className="truncate text-[10px] text-slate-500">
+                {diagnostics?.repoFullName ?? "connected"} · you are{" "}
+                <span className="font-mono">{fingerprint || "—"}</span>
+              </p>
+            </div>
+            <StatusDot
+              halted={diagnostics?.haltedUntilUnixS ?? null}
+              remaining={diagnostics?.remainingRequests ?? null}
+            />
           </div>
-          <StatusDot
-            halted={diagnostics?.haltedUntilUnixS ?? null}
-            remaining={diagnostics?.remainingRequests ?? null}
-          />
+          <div className="mt-2 flex gap-2">
+            <button
+              type="button"
+              className="btn-secondary px-2 py-1 text-[10px]"
+              onClick={() => setShowGroups(true)}
+            >
+              Groups
+            </button>
+            <button
+              type="button"
+              className="btn-secondary px-2 py-1 text-[10px]"
+              onClick={() => void openInvite()}
+            >
+              Invite
+            </button>
+            <button
+              type="button"
+              className="btn-secondary px-2 py-1 text-[10px]"
+              onClick={() => setShowPeople(true)}
+            >
+              People
+            </button>
+          </div>
         </header>
 
         {banner ? (
@@ -880,6 +962,7 @@ export default function App() {
               roster={roster}
               selfPubkey={selfPubkey}
               blockedPubkeys={blocked}
+              onSendText={handleSendText}
               onSendFile={handleSendFile}
               onDownload={handleDownload}
               onBlock={handleBlock}
@@ -987,6 +1070,16 @@ export default function App() {
               </button>
             ))}
           </div>
+          <button
+            type="button"
+            className="btn-secondary w-full"
+            onClick={() => {
+              setShowGroups(false);
+              setShowAddGroup(true);
+            }}
+          >
+            Join or create another group
+          </button>
           <p className="text-xs text-slate-500">
             Switching is local and works offline. Each group keeps its own keys,
             messages, and positions on this device.
@@ -994,13 +1087,72 @@ export default function App() {
         </Modal>
       ) : null}
 
+      {showAddGroup ? (
+        <div className="fixed inset-0 z-40 bg-surface">
+          <GroupSetup
+            banner={banner}
+            onDismissBanner={() => setBanner(null)}
+            onCancel={() => setShowAddGroup(false)}
+            onCreate={handleCreateGroup}
+            onCreateNostr={handleCreateNostrGroup}
+            onJoin={handleJoinGroup}
+          />
+        </div>
+      ) : null}
+
+      {showPeople ? (
+        <PeopleSheet
+          roster={roster}
+          isHost={isHost}
+          accountless={diagnostics?.accountless ?? false}
+          onClose={() => setShowPeople(false)}
+          onSetRole={async (pubkey, role) => {
+            await api.setMemberRole(pubkey, role);
+            await loadGroupState();
+          }}
+          onKick={async (pubkey, password) => {
+            const response = await api.rotateGroupKey(
+              password,
+              [pubkey],
+              "removed by owner",
+            );
+            await loadGroupState();
+            return response;
+          }}
+        />
+      ) : null}
+
+      {askInvitePassword ? (
+        <Modal
+          title="Group code"
+          primaryLabel="Show code"
+          onPrimary={() => void submitShareInvite()}
+          secondaryLabel="Cancel"
+          onSecondary={() => setAskInvitePassword(false)}
+          busy={invitePassword.length === 0}
+        >
+          <p>
+            This device does not have a saved group code. Enter the join password
+            to pack one. The recipient needs that password too.
+          </p>
+          <Field
+            label="Join password"
+            type="password"
+            value={invitePassword}
+            onChange={setInvitePassword}
+            autoComplete="current-password"
+          />
+        </Modal>
+      ) : null}
+
       {invite ? (
         <InviteDisplay
           invite={invite.value}
           fingerprint={invite.fingerprint}
-          label="Group created — invite someone"
+          label="Group code"
+          containsToken={invite.containsToken}
           onDone={() => setInvite(null)}
-          hint="Send this string plus the join password. That is everything a guest needs."
+          hint="Send this code plus the join password. That is everything a guest needs."
         />
       ) : null}
 
@@ -1080,6 +1232,7 @@ function StatusDot({
 interface GroupSetupProps {
   banner: AppError | null;
   onDismissBanner: () => void;
+  onCancel?: () => void;
   onCreate: (input: {
     repoOwner: string;
     repoName: string;
@@ -1112,6 +1265,7 @@ interface GroupSetupProps {
 function GroupSetup({
   banner,
   onDismissBanner,
+  onCancel,
   onCreate,
   onCreateNostr,
   onJoin,
@@ -1223,12 +1377,19 @@ function GroupSetup({
 
   return (
     <div className="flex h-full flex-col">
-      <header className="border-b border-surface-border px-4 py-4">
-        <h1 className="text-base font-semibold text-slate-100">Shadow720</h1>
-        <p className="mt-1 text-xs text-slate-500">
-          Encrypted on this device before anything is stored. No server holds your
-          group's data.
-        </p>
+      <header className="flex items-start justify-between gap-3 border-b border-surface-border px-4 py-4">
+        <div>
+          <h1 className="text-base font-semibold text-slate-100">Shadow720</h1>
+          <p className="mt-1 text-xs text-slate-500">
+            Encrypted on this device before anything is stored. No server holds your
+            group's data.
+          </p>
+        </div>
+        {onCancel ? (
+          <button type="button" className="btn-secondary shrink-0 px-3 py-1 text-xs" onClick={onCancel}>
+            Back
+          </button>
+        ) : null}
       </header>
 
       <div className="flex gap-1 border-b border-surface-border px-4 pt-3">

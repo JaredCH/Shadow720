@@ -39,6 +39,11 @@ pub const MEMBER_EXPIRE_SECS: i64 = 3_600;
 /// Longest text message accepted, before envelope overhead.
 pub const MAX_TEXT_CHARS: usize = 4_000;
 
+/// Roles the owner may assign. Owner itself is pinned in the invite.
+pub fn is_assignable_role(role: &str) -> bool {
+    matches!(role, "admin" | "member")
+}
+
 // ---------------------------------------------------------------------------
 // Identity
 // ---------------------------------------------------------------------------
@@ -149,6 +154,8 @@ pub struct MemberView {
     pub is_stale: bool,
     /// True when the member's key is on the local block list.
     pub is_blocked: bool,
+    /// `owner`, `admin`, or `member`. Owner is the key pinned in the invite.
+    pub role: String,
 }
 
 /// A decrypted chat entry, ready for rendering.
@@ -295,6 +302,10 @@ pub struct GroupState {
     /// Latest decrypted roster.
     pub roster: RwLock<Vec<MemberView>>,
     /// Latest decrypted chat, oldest first.
+    /// Host-assigned roles. Missing keys are members. The pinned host is always owner.
+    pub roles: RwLock<HashMap<String, String>>,
+    /// True once this session has published the saved role set.
+    pub roles_announced: RwLock<bool>,
     pub chat: RwLock<Vec<ChatItem>>,
     /// Own latest known fix, so the UI can render self immediately.
     pub my_fix: RwLock<Option<Fix>>,
@@ -449,11 +460,124 @@ impl GroupState {
             roster_backoff: RwLock::new(AdaptiveBackoff::new(Duration::from_secs(ROSTER_INTERVAL_SECS))),
             rate_halt: RwLock::new(RateLimitHalt::new()),
             jitter: AsyncMutex::new(jitter),
+            roles: RwLock::new(HashMap::new()),
+            roles_announced: RwLock::new(false),
             roster: RwLock::new(Vec::new()),
             chat: RwLock::new(Vec::new()),
             my_fix: RwLock::new(None),
             trails: RwLock::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// Install roles saved in the vault. Does not mark them as announced.
+    pub fn install_roles(&self, roles: &[(String, String)]) {
+        let mut map = self.roles.write();
+        map.clear();
+        for (pubkey, role) in roles {
+            if is_assignable_role(role) {
+                map.insert(pubkey.clone(), role.clone());
+            }
+        }
+        *self.roles_announced.write() = false;
+    }
+
+    /// Role peers should display for `pubkey`.
+    pub fn role_of(&self, pubkey: &str) -> String {
+        if pubkey == self.host_pubkey_b64 {
+            return "owner".to_string();
+        }
+        self.roles
+            .read()
+            .get(pubkey)
+            .cloned()
+            .filter(|role| is_assignable_role(role))
+            .unwrap_or_else(|| "member".to_string())
+    }
+
+    /// Assign `admin` or `member`. The pinned host cannot be reassigned.
+    pub fn assign_role(&self, pubkey: &str, role: &str) -> Result<()> {
+        if !self.is_host || self.identity.pubkey_b64 != self.host_pubkey_b64 {
+            return Err(AppError::group_state("only the owner may assign roles"));
+        }
+        if pubkey == self.host_pubkey_b64 || pubkey == self.identity.pubkey_b64 {
+            return Err(AppError::invalid_argument("the owner role is pinned by the invite and cannot be changed"));
+        }
+        if !is_assignable_role(role) {
+            return Err(AppError::invalid_argument("role must be admin or member"));
+        }
+        self.roles.write().insert(pubkey.to_string(), role.to_string());
+        self.stamp_roles();
+        *self.roles_announced.write() = false;
+        Ok(())
+    }
+
+    /// Current assignable grants, for publishing and for the vault.
+    pub fn role_grants(&self) -> Vec<crypto::RoleGrant> {
+        let mut grants: Vec<crypto::RoleGrant> = self
+            .roles
+            .read()
+            .iter()
+            .filter(|(_, role)| is_assignable_role(role))
+            .map(|(pubkey, role)| crypto::RoleGrant {
+                member_pubkey: pubkey.clone(),
+                role: role.clone(),
+            })
+            .collect();
+        grants.sort_by(|a, b| a.member_pubkey.cmp(&b.member_pubkey));
+        grants
+    }
+
+    /// Apply the newest host-signed role set found in `comments`.
+    pub fn apply_role_controls(&self, comments: &[IssueComment]) {
+        let mut best: Option<(i64, Vec<crypto::RoleGrant>)> = None;
+        for comment in comments {
+            let Ok(envelope) = serde_json::from_str::<EncryptedEnvelope>(&comment.body) else {
+                continue;
+            };
+            if envelope.sender_pubkey != self.host_pubkey_b64 {
+                continue;
+            }
+            let Ok(payload) = self.keys.read().open(&envelope) else {
+                continue;
+            };
+            let InnerPayload::Control(ControlPayload::RoleSet { grants, unix_ms }) = payload else {
+                continue;
+            };
+            if best.as_ref().map(|(seen, _)| unix_ms >= *seen).unwrap_or(true) {
+                best = Some((unix_ms, grants));
+            }
+        }
+        let Some((_, grants)) = best else {
+            return;
+        };
+        let mut map = self.roles.write();
+        map.clear();
+        for grant in grants {
+            if is_assignable_role(&grant.role) && grant.member_pubkey != self.host_pubkey_b64 {
+                map.insert(grant.member_pubkey, grant.role);
+            }
+        }
+        drop(map);
+        self.stamp_roles();
+    }
+
+    fn stamp_roles(&self) {
+        for member in self.roster.write().iter_mut() {
+            member.role = self.role_of(&member.pubkey_b64);
+        }
+    }
+
+    /// Seal the current role set under the live group key.
+    pub fn build_role_envelope(&self, unix_ms: i64) -> Result<EncryptedEnvelope> {
+        if !self.is_host {
+            return Err(AppError::group_state("only the owner may publish roles"));
+        }
+        let key = self.current_group_key()?;
+        let payload = ControlPayload::RoleSet {
+            grants: self.role_grants(),
+            unix_ms,
+        };
+        crypto::seal_control(&key, self.current_epoch(), self.identity.signing_key(), &payload)
     }
 
     /// The group key for the current epoch.
@@ -791,6 +915,7 @@ impl GroupState {
             is_self,
             is_stale: age_s > MEMBER_STALE_SECS,
             is_blocked: self.is_blocked(sender_pubkey),
+            role: self.role_of(sender_pubkey),
         }
     }
 

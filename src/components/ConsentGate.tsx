@@ -153,6 +153,8 @@ interface InviteDisplayProps {
   onDone: () => void;
   /** Short explanation of what the recipient must do. */
   hint?: string;
+  /** GitHub invites embed the group token. Nostr invites do not. */
+  containsToken?: boolean;
 }
 
 /**
@@ -167,6 +169,7 @@ export function InviteDisplay({
   label,
   onDone,
   hint,
+  containsToken = true,
 }: InviteDisplayProps) {
   const [revealed, setRevealed] = useState(false);
 
@@ -188,11 +191,18 @@ export function InviteDisplay({
           <div className="flex gap-2">
             <CopyButton text={invite} label="Copy invite" />
           </div>
-          <p className="text-xs text-amber-300">
-            This string contains the group's GitHub token. Anyone holding it can read
-            the group and delete the repository. Share it only with people you trust,
-            over a channel you trust.
-          </p>
+          {containsToken ? (
+            <p className="text-xs text-amber-300">
+              This string contains the group's GitHub token. Anyone holding it can read
+              the group and delete the repository. Share it only with people you trust,
+              over a channel you trust.
+            </p>
+          ) : (
+            <p className="text-xs text-amber-300">
+              Anyone with this code and the join password can join the group. Share it
+              only with people you trust.
+            </p>
+          )}
         </>
       ) : (
         <button

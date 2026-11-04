@@ -315,6 +315,7 @@ export function SettingsPanel({
                       <span className="block truncate text-xs text-slate-200">
                         {member.displayName || "Unnamed"}
                         {member.isSelf ? " (you)" : ""}
+                        {member.role ? ` · ${member.role}` : ""}
                       </span>
                       <span className="block font-mono text-[10px] text-slate-500">
                         {shortKey(member.pubkeyB64)}

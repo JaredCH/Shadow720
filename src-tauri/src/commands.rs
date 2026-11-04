@@ -611,6 +611,8 @@ pub struct RotateResponse {
     pub invites: Vec<MemberInvite>,
     /// Members who were removed as part of this rotation.
     pub removed_pubkeys: Vec<String>,
+    /// One current group code the owner can hand to anyone who should stay.
+    pub group_invite: String,
 }
 
 /// An invite string bound to one member.
@@ -632,6 +634,29 @@ pub struct RotateRequest {
     /// Members to remove as part of the rotation.
     #[serde(default)]
     pub remove_pubkeys: Vec<String>,
+}
+
+/// Request to pack the current group code.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareInviteRequest {
+    pub join_password: String,
+}
+
+/// A freshly packed group code.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareInviteResponse {
+    pub invite: String,
+    pub fingerprint: String,
+}
+
+/// Request to promote or demote a member.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRoleRequest {
+    pub pubkey_b64: String,
+    pub role: String,
 }
 
 /// Request to re-key the group with a replacement token.
@@ -765,6 +790,7 @@ pub async fn unlock_vault(
         }
         let identity = Identity::from_secret(stored.identity_secret);
         let group_state = GroupState::from_invite(&stored.invite, identity, stored.preferences.clone(), stored.is_host)?;
+        group_state.install_roles(&stored.roles.iter().map(|role| (role.pubkey_b64.clone(), role.role.clone())).collect::<Vec<_>>());
         *state.group.write() = Some(Arc::new(group_state));
     }
     *state.vault.write() = Some(Arc::new(vault));
@@ -869,6 +895,9 @@ pub fn switch_group(state: State<'_, AppState>, group_id: String) -> Result<()> 
         stored.preferences.clone(),
         stored.is_host,
     )?;
+    group_state.install_roles(
+        &stored.roles.iter().map(|role| (role.pubkey_b64.clone(), role.role.clone())).collect::<Vec<_>>(),
+    );
     *state.group.write() = Some(Arc::new(group_state));
     Ok(())
 }
@@ -1311,6 +1340,8 @@ pub async fn create_nostr_group(
             preferences: preferences.clone(),
             is_host: true,
             uploads: Vec::new(),
+            invite_code: Some(invite.clone()),
+            roles: Vec::new(),
         }),
     )?;
 
@@ -1441,6 +1472,8 @@ pub async fn create_group(
             preferences: preferences.clone(),
             is_host: true,
             uploads: Vec::new(),
+            invite_code: Some(invite.clone()),
+            roles: Vec::new(),
         }),
     )?;
 
@@ -1543,6 +1576,8 @@ pub async fn join_group(
             invite: invite.clone(),
             identity_secret: *identity.secret_bytes(),
             preferences: preferences.clone(),
+            invite_code: Some(request.invite.trim().to_string()),
+            roles: Vec::new(),
             is_host: false,
             uploads: Vec::new(),
         }),
@@ -1659,6 +1694,10 @@ pub async fn poll_roster(state: State<'_, AppState>) -> Result<PollResponse> {
         let store = state.nostr_store()?;
         let comments = store.read_roster().await?;
         group_state.apply_roster(&comments);
+        if let Ok(controls) = store.read_control().await {
+            group_state.apply_role_controls(&controls);
+        }
+        announce_roles_if_needed(state.clone(), &group_state).await;
         return Ok(PollResponse {
             next_delay_ms: group_state.roster_delay(false).await.as_millis() as u64,
             not_modified: false,
@@ -1674,6 +1713,8 @@ pub async fn poll_roster(state: State<'_, AppState>) -> Result<PollResponse> {
 
     if !not_modified {
         group_state.apply_roster(&comments);
+        group_state.apply_role_controls(&comments);
+        announce_roles_if_needed(state.clone(), &group_state).await;
     }
     group_state.observe_rate_limit(200, None, None, None);
 
@@ -2146,7 +2187,10 @@ pub async fn check_rotation(state: State<'_, AppState>) -> Result<Option<Rotatio
     let group_state = state.group()?;
 
     let comments = if state.is_nostr()? {
-        state.nostr_store()?.read_roster().await?
+        let store = state.nostr_store()?;
+        let mut comments = store.read_roster().await?;
+        comments.extend(store.read_rotations().await?);
+        comments
     } else {
         state
             .client()?
@@ -2178,6 +2222,43 @@ pub async fn check_rotation(state: State<'_, AppState>) -> Result<Option<Rotatio
     Ok(None)
 }
 
+/// The invite string already saved on this device, if there is one.
+#[tauri::command]
+pub fn current_invite(state: State<'_, AppState>) -> Result<Option<String>> {
+    let _group = state.group()?;
+    Ok(state.vault()?.invite_code())
+}
+
+/// Pack a fresh invite from the live group key.
+///
+/// Any member can do this. It does not rotate the key. The join password is
+/// required because it is what seals the string.
+#[tauri::command]
+pub fn share_invite(state: State<'_, AppState>, request: ShareInviteRequest) -> Result<ShareInviteResponse> {
+    let group_state = state.group()?;
+    let vault = state.vault()?;
+    if request.join_password.is_empty() {
+        return Err(AppError::invalid_argument("the join password is required to pack the group code"));
+    }
+    let invite = pack_current_invite(&group_state, &request.join_password, &state.pat_for_invites()?)?;
+    vault.save_invite_code(&invite)?;
+    Ok(ShareInviteResponse {
+        invite,
+        fingerprint: group_state.identity.fingerprint(),
+    })
+}
+
+/// Assign `admin` or `member`. Only the pinned owner may do this.
+#[tauri::command]
+pub async fn set_member_role(state: State<'_, AppState>, request: SetRoleRequest) -> Result<()> {
+    let group_state = state.group()?;
+    group_state.assign_role(&request.pubkey_b64, &request.role)?;
+    state.vault()?.save_roles(&stored_roles(&group_state))?;
+    publish_role_set(&state, &group_state).await?;
+    *group_state.roles_announced.write() = true;
+    Ok(())
+}
+
 /// Rotate the group key, optionally removing members.
 #[tauri::command]
 pub async fn rotate_group_key(
@@ -2198,52 +2279,44 @@ pub async fn rotate_group_key(
         ));
     }
 
-    let client = state.client()?;
-    let comments = client.list_comments(group_state.roster_issue_num).await?;
-    group_state.apply_roster(&comments);
-
-    // Locate the comments belonging to members being removed.
-    let member_ids = group::comment_ids_by_pubkey(&group_state.roster.read());
-    let mut removed_pubkeys = Vec::new();
-    for pubkey in &request.remove_pubkeys {
-        match member_ids.get(pubkey) {
-            Some(comment_id) => {
-                client.delete_comment(*comment_id).await?;
-                removed_pubkeys.push(pubkey.clone());
-            }
-            None => {
-                return Err(AppError::group_state(format!(
-                    "member {pubkey} is not in the current roster, so it cannot be removed"
-                )))
-            }
-        }
-    }
+    let removed_pubkeys = if state.is_nostr()? {
+        confirm_removals(&group_state, &request.remove_pubkeys)?;
+        request.remove_pubkeys.clone()
+    } else {
+        let client = state.client()?;
+        let comments = client.list_comments(group_state.roster_issue_num).await?;
+        group_state.apply_roster(&comments);
+        delete_removed_members(&client, &group_state, &request.remove_pubkeys).await?
+    };
 
     let new_epoch = group_state
         .current_epoch()
         .checked_add(1)
         .ok_or_else(|| AppError::group_state("the group has exhausted its key epochs"))?;
-
     let new_key = *crypto::new_group_key()?;
-
-    // Announce the rotation under the *new* key so only members who receive a
-    // re-issued invite can read it.
     let reason = request
         .reason
         .clone()
         .unwrap_or_else(|| "scheduled rotation".to_string());
-    let envelope =
-        group_state.build_rotation_envelope_with_key(new_epoch, group_state.current_epoch(), &reason, now_unix_ms(), &new_key)?;
+    let envelope = group_state.build_rotation_envelope_with_key(
+        new_epoch,
+        group_state.current_epoch(),
+        &reason,
+        now_unix_ms(),
+        &new_key,
+    )?;
     let body = serde_json::to_string(&envelope)
         .map_err(|e| AppError::crypto(format!("could not serialize the envelope: {e}")))?;
-    client
-        .create_comment(group_state.roster_issue_num, &body)
-        .await?;
 
-    // Promote the key locally only after the announcement is stored, so peers
-    // cannot see a rotation we failed to publish.
+    // Announce under the new key before installing it locally, so a failed publish
+    // does not leave this device ahead of everyone else.
+    if state.is_nostr()? {
+        state.nostr_store()?.publish_rotation(&body).await?;
+    } else {
+        state.client()?.create_comment(group_state.roster_issue_num, &body).await?;
+    }
+
     group_state.apply_rotation(new_epoch, new_key)?;
-
     let descriptor = VaultDescriptor {
         version: DESCRIPTOR_VERSION,
         keystore_alias: vault.keystore_alias(),
@@ -2252,21 +2325,24 @@ pub async fn rotate_group_key(
     };
     vault.update_group_key(&new_key, &descriptor)?;
 
-    // Re-issue an invite per remaining member, each bound to its public key.
+    let pat = state.pat_for_invites()?;
     let invites = build_member_invites(
         &group_state,
         &request.join_password,
         new_epoch,
         &new_key,
         &removed_pubkeys,
-            &state.pat_for_invites()?,
-        )?;
+        &pat,
+    )?;
+    let group_invite = pack_current_invite(&group_state, &request.join_password, &pat)?;
+    let _ = vault.save_invite_code(&group_invite);
 
     Ok(RotateResponse {
         new_epoch,
         retired_epoch: new_epoch.saturating_sub(1),
         invites,
         removed_pubkeys,
+        group_invite,
     })
 }
 
@@ -2625,6 +2701,96 @@ fn generate_repo_name() -> String {
     format!("grp-{suffix}")
 }
 
+/// Republish saved roles once per session so a restarted owner does not lose them on relays.
+async fn announce_roles_if_needed(state: State<'_, AppState>, group_state: &GroupState) {
+    if !group_state.is_host || *group_state.roles_announced.read() || group_state.role_grants().is_empty() {
+        return;
+    }
+    if publish_role_set(&state, group_state).await.is_ok() {
+        *group_state.roles_announced.write() = true;
+    }
+}
+
+async fn publish_role_set(state: &State<'_, AppState>, group_state: &GroupState) -> Result<()> {
+    let envelope = group_state.build_role_envelope(now_unix_ms())?;
+    let body = serde_json::to_string(&envelope)
+        .map_err(|e| AppError::crypto(format!("could not serialize the role set: {e}")))?;
+    if state.is_nostr()? {
+        state.nostr_store()?.publish_control(&body).await?;
+    } else {
+        state.client()?.create_comment(group_state.roster_issue_num, &body).await?;
+    }
+    Ok(())
+}
+
+fn stored_roles(group_state: &GroupState) -> Vec<crate::vault::StoredRole> {
+    group_state
+        .role_grants()
+        .into_iter()
+        .map(|grant| crate::vault::StoredRole {
+            pubkey_b64: grant.member_pubkey,
+            role: grant.role,
+        })
+        .collect()
+}
+
+fn pack_current_invite(group_state: &GroupState, join_password: &str, repo_scoped_pat: &str) -> Result<String> {
+    let payload = InviteCredentialsPayload {
+        version: PROTOCOL_VERSION,
+        backend: group_state.backend.kind(),
+        repo_owner: group_state.repo.owner.clone(),
+        repo_name: group_state.repo.name.clone(),
+        repo_scoped_pat: repo_scoped_pat.to_string(),
+        group_master_key: group_state.current_group_key()?,
+        roster_issue_num: group_state.roster_issue_num,
+        chat_issue_num: group_state.chat_issue_num,
+        release_id: group_state.release_id,
+        repo_created: true,
+        relays: group_state.relays.clone(),
+        blossom_servers: group_state.blossom_servers.clone(),
+        group_id: group_state.group_id.clone(),
+        host_pubkey: group_state.host_pubkey_b64.clone(),
+        group_label: group_state.group_label.clone(),
+        key_epoch: group_state.current_epoch(),
+    };
+    crypto::pack_invite(&payload, join_password)
+}
+
+fn confirm_removals(group_state: &GroupState, remove_pubkeys: &[String]) -> Result<()> {
+    let roster = group_state.roster.read();
+    for pubkey in remove_pubkeys {
+        if pubkey == &group_state.host_pubkey_b64 {
+            return Err(AppError::invalid_argument("the owner cannot be removed"));
+        }
+        if !roster.iter().any(|member| member.pubkey_b64 == *pubkey) {
+            return Err(AppError::group_state(format!(
+                "member {pubkey} is not in the current roster, so it cannot be removed"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn delete_removed_members(
+    client: &crate::github_db::GitHubClient,
+    group_state: &GroupState,
+    remove_pubkeys: &[String],
+) -> Result<Vec<String>> {
+    confirm_removals(group_state, remove_pubkeys)?;
+    let member_ids = group::comment_ids_by_pubkey(&group_state.roster.read());
+    let mut removed = Vec::new();
+    for pubkey in remove_pubkeys {
+        let comment_id = member_ids.get(pubkey).copied().ok_or_else(|| {
+            AppError::group_state(format!(
+                "member {pubkey} is not in the current roster, so it cannot be removed"
+            ))
+        })?;
+        client.delete_comment(comment_id).await?;
+        removed.push(pubkey.clone());
+    }
+    Ok(removed)
+}
+
 /// Build one invite per member, excluding removed members.
 ///
 /// The PAT is passed in explicitly because it lives in the vault, not in group
@@ -2638,7 +2804,7 @@ fn build_member_invites(
     excluded: &[String],
     repo_scoped_pat: &str,
 ) -> Result<Vec<MemberInvite>> {
-    if repo_scoped_pat.trim().is_empty() {
+    if group_state.backend.kind().requires_account() && repo_scoped_pat.trim().is_empty() {
         return Err(AppError::NotConfigured(
             "no group token is stored, so invites cannot be re-issued".into(),
         ));
@@ -2757,7 +2923,8 @@ mod tests {
             repo_full_name: "nostr:closure-test".into(), current_epoch: 0 };
         vault.store_group_contents(&VaultContents { pat: nostr.secret_hex().to_string(), group_key: Zeroizing::new([9; 32]) },
             &descriptor, Some(StoredGroup { invite: invite.clone(), identity_secret: *guest_identity.secret_bytes(),
-                preferences: test_preferences(), is_host: false, uploads: Vec::new() })).expect("store");
+                preferences: test_preferences(), is_host: false, uploads: Vec::new(),
+                invite_code: None, roles: Vec::new() })).expect("store");
         let state = AppState::new();
         *state.vault.write() = Some(vault);
         *state.group.write() = Some(Arc::new(guest_group));
@@ -2803,7 +2970,8 @@ mod tests {
         vault.store_group_contents(&VaultContents { pat: nostr.secret_hex().to_string(), group_key: Zeroizing::new([8; 32]) },
             &descriptor, Some(StoredGroup { invite, identity_secret: *host.secret_bytes(), preferences: test_preferences(),
                 is_host: true, uploads: vec![StoredUpload { sha256: sha256.clone(), server: server_url,
-                    size: 6, event: original, deleted: false, notice_published: false }] })).expect("store");
+                    size: 6, event: original, deleted: false, notice_published: false }],
+                invite_code: None, roles: Vec::new() })).expect("store");
         let state = AppState::new();
         *state.vault.write() = Some(vault.clone());
         *state.group.write() = Some(Arc::new(group));

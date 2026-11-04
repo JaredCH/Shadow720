@@ -217,6 +217,8 @@ export interface MemberView {
   isSelf: boolean;
   isStale: boolean;
   isBlocked: boolean;
+  /** `owner`, `admin`, or `member`. Owner is pinned by the invite. */
+  role: string;
 }
 
 /** One recorded position on a member's trail. */
@@ -310,6 +312,8 @@ export interface RotateResponse {
   retiredEpoch: number;
   invites: MemberInvite[];
   removedPubkeys: string[];
+  /** Current group code for everyone who should stay after a kick. */
+  groupInvite: string;
 }
 
 export interface RekeyResponse {
@@ -447,6 +451,23 @@ export const switchGroup = (groupId: string) =>
 /** Forget one stored group. Returns true when it was the active one. */
 export const forgetGroup = (groupId: string) =>
   call<boolean>("forget_group", { groupId });
+
+/** The group code already saved on this device, if one has been packed. */
+export const currentInvite = () => call<string | null>("current_invite");
+
+/**
+ * Pack a fresh group code from the live key.
+ *
+ * Any member can do this. The join password seals the string and is not stored.
+ */
+export const shareInvite = (joinPassword: string) =>
+  call<{ invite: string; fingerprint: string }>("share_invite", {
+    request: { joinPassword },
+  });
+
+/** Owner only. `role` is `admin` or `member`. */
+export const setMemberRole = (pubkeyB64: string, role: "admin" | "member") =>
+  call<void>("set_member_role", { request: { pubkeyB64, role } });
 export const lockVault = () => call<void>("lock_vault");
 
 // -- Onboarding -------------------------------------------------------------

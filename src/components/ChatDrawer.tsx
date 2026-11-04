@@ -16,6 +16,8 @@ interface ChatDrawerProps {
   roster: MemberView[];
   selfPubkey: string;
   blockedPubkeys: Set<string>;
+  /** Posts an encrypted text message. */
+  onSendText: (text: string) => Promise<void>;
   /** Uploads the bytes and posts the pointer envelope. */
   onSendFile: (file: File, caption?: string) => Promise<void>;
   /** Fetches and verifies a shared blob. */
@@ -40,6 +42,7 @@ export function ChatDrawer({
   roster,
   selfPubkey,
   blockedPubkeys,
+  onSendText,
   onSendFile,
   onDownload,
   onBlock,
@@ -69,6 +72,21 @@ export function ChatDrawer({
     if (!list) return;
     list.scrollTop = list.scrollHeight;
   }, [items.length]);
+  const handleSendText = async () => {
+    const text = draft.trim();
+    if (!text || busy) return;
+    setError(null);
+    setNotice(null);
+    setBusy(true);
+    try {
+      await onSendText(text);
+      setDraft("");
+    } catch (thrown) {
+      setError(thrown as AppError);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const handlePickFile = async (file: File) => {
     setError(null);
@@ -311,12 +329,12 @@ export function ChatDrawer({
         />
         <button
           type="button"
-          className="btn-secondary shrink-0 px-3"
+          className="btn-secondary shrink-0 px-3 text-xs"
           disabled={busy}
           onClick={() => fileInputRef.current?.click()}
           title={`Share a file (max ${formatBytes(MAX_FILE_BYTES)})`}
         >
-          📎
+          File
         </button>
         <textarea
           className="field max-h-24 flex-1 resize-none py-2"
@@ -324,7 +342,21 @@ export function ChatDrawer({
           placeholder="Message"
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey) {
+              event.preventDefault();
+              void handleSendText();
+            }
+          }}
         />
+        <button
+          type="button"
+          className="btn-primary shrink-0 px-3 text-xs"
+          disabled={busy || draft.trim().length === 0}
+          onClick={() => void handleSendText()}
+        >
+          Send
+        </button>
       </div>
     </div>
   );

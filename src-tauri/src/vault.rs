@@ -167,6 +167,22 @@ pub struct StoredGroup {
     pub is_host: bool,
     #[serde(default)]
     pub uploads: Vec<StoredUpload>,
+    /// Last `GRP1-` string this device packed or joined with.
+    ///
+    /// Absent on vaults created before invite sharing was saved. The join password
+    /// is not stored; packing a fresh string still requires it.
+    #[serde(default)]
+    pub invite_code: Option<String>,
+    /// Host-assigned roles other than owner. Empty means every non-host is a member.
+    #[serde(default)]
+    pub roles: Vec<StoredRole>,
+}
+
+/// A role the host assigned to a member.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoredRole {
+    pub pubkey_b64: String,
+    pub role: String,
 }
 
 /// Locally owned Blossom upload and its deletion progress.
@@ -184,6 +200,9 @@ impl Drop for StoredGroup {
     fn drop(&mut self) {
         use zeroize::Zeroize;
         self.identity_secret.zeroize();
+        if let Some(code) = self.invite_code.as_mut() {
+            code.zeroize();
+        }
     }
 }
 
@@ -756,6 +775,51 @@ impl SecureVault {
         Ok(self.contents.lock().as_ref().and_then(|payload| payload.group.clone()))
     }
 
+    /// Remember the packed invite string on the active group.
+    pub fn save_invite_code(&self, code: &str) -> Result<()> {
+        if !code.starts_with(crate::crypto::INVITE_PREFIX) {
+            return Err(AppError::invalid_argument("that is not a group invite string"));
+        }
+        self.mutate_active_group(|group| {
+            group.invite_code = Some(code.to_string());
+        })
+    }
+
+    /// Remember host-assigned roles on the active group.
+    pub fn save_roles(&self, roles: &[StoredRole]) -> Result<()> {
+        let roles = roles.to_vec();
+        self.mutate_active_group(|group| {
+            group.roles = roles;
+        })
+    }
+
+    /// The invite string saved for the active group, if this device has one.
+    pub fn invite_code(&self) -> Option<String> {
+        self.contents.lock().as_ref().and_then(|payload| {
+            payload.group.as_ref().and_then(|group| group.invite_code.clone())
+        })
+    }
+
+    fn mutate_active_group(&self, change: impl FnOnce(&mut StoredGroup)) -> Result<()> {
+        let mut guard = self.contents.lock();
+        let payload = guard.as_mut().ok_or_else(|| AppError::vault("no group is stored in this vault"))?;
+        let previous = payload.group.clone();
+        let group = payload.group.as_mut().ok_or_else(|| {
+            AppError::vault("the stored group cannot be restored; rejoin with a fresh invite")
+        })?;
+        change(group);
+        if let Some(id) = payload.active_group.clone() {
+            if let Some(slot) = payload.groups.iter_mut().find(|slot| slot.id == id) {
+                slot.group = payload.group.clone();
+            }
+        }
+        if let Err(error) = self.write_payload(payload) {
+            payload.group = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Persist local preferences without replacing group credentials.
     pub fn update_preferences(&self, preferences: &crate::group::Preferences) -> Result<()> {
         let mut guard = self.contents.lock();
@@ -832,6 +896,23 @@ impl SecureVault {
             }
         };
         payload.group_key = *group_key;
+        if let Some(group) = payload.group.as_mut() {
+            group.invite.group_master_key = *group_key;
+            group.invite.key_epoch = descriptor.current_epoch;
+            // The previously packed string seals the retired key.
+            group.invite_code = None;
+        }
+        if let Some(id) = payload.active_group.clone() {
+            if let Some(slot) = payload.groups.iter_mut().find(|slot| slot.id == id) {
+                slot.group_key = *group_key;
+                slot.descriptor = descriptor.clone();
+                if let Some(group) = slot.group.as_mut() {
+                    group.invite.group_master_key = *group_key;
+                    group.invite.key_epoch = descriptor.current_epoch;
+                    group.invite_code = None;
+                }
+            }
+        }
         self.write_payload(&payload)?;
 
         *guard = Some(payload);
@@ -1203,6 +1284,8 @@ mod tests {
             preferences: crate::group::Preferences::seeded(),
             is_host: true,
             uploads: Vec::new(),
+            invite_code: None,
+            roles: Vec::new(),
         };
         vault.store_group_contents(&contents(), &descriptor_for("nostr/private-group"), Some(group)).expect("store");
         let nostr = crate::nostr::NostrIdentity::from_secret_bytes([11; 32]).expect("nostr");

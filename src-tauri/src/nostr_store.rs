@@ -23,7 +23,7 @@ use crate::github_db::IssueComment;
 use crate::nostr::{
     blossom_auth_header, build_blossom_auth, build_deletion_request, sign_event, BlobRef, Event,
     Filter, NostrIdentity, KIND_CHAT, KIND_DELETE, KIND_FILE, KIND_FILE_LEGACY, KIND_FILE_REMOVED,
-    KIND_GROUP_CLOSED, KIND_ROSTER,
+    KIND_CONTROL, KIND_GROUP_CLOSED, KIND_ROSTER, KIND_ROTATION,
 };
 use crate::nostr_relay::{newest_per_slot, publish_to_all, query_all};
 
@@ -209,6 +209,61 @@ impl NostrStore {
         }
         let request = build_deletion_request(&self.identity, &event.id, event.kind, "")?;
         publish_to_all(&self.relays, &request).await
+    }
+
+    /// Publish the host's latest role set. Addressable, so it replaces the previous set.
+    pub async fn publish_control(&self, envelope_json: &str) -> Result<String> {
+        let event = sign_event(
+            &self.identity,
+            KIND_CONTROL,
+            vec![vec!["d".to_string(), self.group_id.clone()]],
+            envelope_json,
+            crate::nostr::now_unix_s(),
+        )?;
+        publish_to_all(&self.relays, &event).await?;
+        Ok(event.id)
+    }
+
+    /// Read role-set events for this group.
+    pub async fn read_control(&self) -> Result<Vec<IssueComment>> {
+        let filter = Filter {
+            kinds: Some(vec![KIND_CONTROL]),
+            d_tags: Some(vec![self.group_id.clone()]),
+            ..Filter::default()
+        };
+        let events = query_all(&self.relays, vec![filter]).await?;
+        let collapsed = newest_per_slot(events);
+        Ok(collapsed
+            .iter()
+            .filter(|event| event.kind == KIND_CONTROL && event.d_tag() == Some(self.group_id.as_str()))
+            .map(IssueComment::from_nostr_event)
+            .collect())
+    }
+
+    /// Publish a key-rotation notice. Append-only, so guests can still see the epoch.
+    pub async fn publish_rotation(&self, envelope_json: &str) -> Result<String> {
+        let event = sign_event(
+            &self.identity,
+            KIND_ROTATION,
+            vec![vec!["d".to_string(), self.group_id.clone()]],
+            envelope_json,
+            crate::nostr::now_unix_s(),
+        )?;
+        publish_to_all(&self.relays, &event).await?;
+        Ok(event.id)
+    }
+
+    /// Read rotation notices for this group.
+    pub async fn read_rotations(&self) -> Result<Vec<IssueComment>> {
+        let filter = Filter {
+            kinds: Some(vec![KIND_ROTATION]),
+            d_tags: Some(vec![self.group_id.clone()]),
+            ..Filter::default()
+        };
+        Ok(query_all(&self.relays, vec![filter]).await?.into_iter()
+            .filter(|event| event.kind == KIND_ROTATION && event.d_tag() == Some(self.group_id.as_str()))
+            .map(|event| IssueComment::from_nostr_event(&event))
+            .collect())
     }
 
     /// Publish this device's roster slot.

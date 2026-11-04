@@ -506,6 +506,22 @@ pub enum ControlPayload {
         comment_id: u64,
         unix_ms: i64,
     },
+    /// The host's current role assignments. Latest message wins.
+    ///
+    /// `owner` is not assignable: it is the key pinned in the invite. `admin` and
+    /// `member` are the only values peers should honor.
+    RoleSet {
+        grants: Vec<RoleGrant>,
+        unix_ms: i64,
+    },
+}
+
+/// One member's role, as assigned by the host.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleGrant {
+    pub member_pubkey: String,
+    /// `admin` or `member`.
+    pub role: String,
 }
 
 // ---------------------------------------------------------------------------

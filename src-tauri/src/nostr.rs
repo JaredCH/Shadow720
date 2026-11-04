@@ -50,6 +50,11 @@ pub const KIND_FILE_LEGACY: u64 = 30_080;
 pub const KIND_FILE: u64 = 8_096;
 /// Host-authenticated group closure, addressable by group id.
 pub const KIND_GROUP_CLOSED: u64 = 30_081;
+/// Host role assignments, addressable by group id so the latest set replaces older ones.
+pub const KIND_CONTROL: u64 = 30_082;
+/// Key-rotation notice. Regular (not addressable) so a newer notice cannot erase
+/// the epoch a guest still needs in order to notice they were cut off.
+pub const KIND_ROTATION: u64 = 8_098;
 /// An uploader's signed notice that a Blossom file was removed.
 pub const KIND_FILE_REMOVED: u64 = 8_097;
 /// NIP-09 deletion request.
