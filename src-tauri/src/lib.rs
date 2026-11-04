@@ -105,8 +105,12 @@ pub fn run() {
 
     #[cfg(target_os = "android")]
     {
-        // Registers the Android keystore plugin and installs the trait object.
-        builder = builder.plugin(keystore_android::init());
+        // Each Android class needs its own Rust plugin name. Registering both
+        // from one plugin makes the second replace the first, so vault commands
+        // were delivered to the location plugin and the app could not start.
+        builder = builder
+            .plugin(keystore_android::init_keystore())
+            .plugin(keystore_android::init_location());
     }
 
     #[cfg(windows)]

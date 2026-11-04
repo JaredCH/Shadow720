@@ -419,9 +419,11 @@ export const discardLegacyGroup = () => call<void>("discard_legacy_group");
  * Delete the local vault so an unreadable one can be replaced.
  *
  * The only escape from a vault whose device key was invalidated. Nothing remote
- * is touched.
+ * is touched. `vaultDir` is required because the vault is not open when this is
+ * needed: the reset button only appears after unlocking failed.
  */
-export const resetVault = () => call<void>("reset_vault");
+export const resetVault = (vaultDir: string) =>
+  call<void>("reset_vault", { request: { vaultDir } });
 
 /** A group this device belongs to, with no secrets. */
 export interface GroupSummary {

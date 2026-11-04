@@ -5,7 +5,9 @@
 //! mobile-only Tauri APIs while still shipping the real implementation to the
 //! device.
 //!
-//! Two plugins live behind this module:
+//! Two plugins live behind this module, each as its own Tauri plugin. Tauri keys
+//! an Android class by the Rust plugin name, so registering both classes from one
+//! plugin makes the second replace the first.
 //!
 //! * **`KeystoreVaultPlugin`** — wraps the 32-byte vault password with a key held
 //!   in the device's secure element. Exposes exactly `wrapSecret` and
@@ -34,6 +36,19 @@ const ANDROID_PACKAGE: &str = "com.shadow720.app";
 const KEYSTORE_PLUGIN_CLASS: &str = "KeystoreVaultPlugin";
 /// Kotlin plugin class that controls the location foreground service.
 const LOCATION_PLUGIN_CLASS: &str = "LocationServicePlugin";
+
+/// Rust plugin id the keystore class is registered under.
+///
+/// `register_android_plugin` keys the Android class by this name, not by the
+/// Kotlin class. Two classes registered from one Rust plugin share that key, and
+/// the second `load` replaces the first. `wrapSecret` was then dispatched to
+/// `LocationServicePlugin` ("no command wrapSecret found"), so the vault could
+/// neither open nor be reset.
+const KEYSTORE_PLUGIN_NAME: &str = "shadow720-keystore";
+/// Rust plugin id the location-service class is registered under.
+///
+/// Must stay distinct from [`KEYSTORE_PLUGIN_NAME`]. See that constant.
+const LOCATION_PLUGIN_NAME: &str = "shadow720-location";
 
 /// Alias of the wrapping key inside the Android Keystore.
 const KEY_ALIAS: &str = "shadow720.vault.wrap";
@@ -121,6 +136,23 @@ impl<R: Runtime> Keystore for AndroidKeystore<R> {
 
     fn key_alias(&self) -> String {
         KEY_ALIAS.to_string()
+    }
+
+    fn delete_key(&self) -> Result<()> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Response {
+            deleted: bool,
+        }
+
+        let response: Response = self
+            .handle
+            .run_mobile_plugin("deleteKey", serde_json::json!({ "alias": KEY_ALIAS }))
+            .map_err(|e| AppError::vault(format!("could not delete the device key: {e}")))?;
+        if !response.deleted {
+            return Err(AppError::vault("the device key could not be deleted"));
+        }
+        Ok(())
     }
 }
 
@@ -216,21 +248,30 @@ impl<R: Runtime> LocationServiceHandle<R> {
     }
 }
 
-/// Register the plugins and install the managed state they provide.
+/// Register the keystore plugin and install it as the vault [`Keystore`].
 ///
 /// Must run before the commands are invoked, which the builder ordering guarantees.
-pub fn init<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("shadow720-android")
+/// A registration failure is propagated: without this plugin the vault cannot open.
+pub fn init_keystore<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new(KEYSTORE_PLUGIN_NAME)
         .setup(|app, api| {
-            // The keystore is essential: without it the vault cannot be opened, so
-            // a registration failure is propagated and the app fails loudly.
             let keystore_handle =
                 api.register_android_plugin(ANDROID_PACKAGE, KEYSTORE_PLUGIN_CLASS)?;
             let keystore: Arc<dyn Keystore> = Arc::new(AndroidKeystore::new(keystore_handle));
             app.manage(keystore);
+            Ok(())
+        })
+        .build()
+}
 
-            // The location service is not essential to launch: an app that cannot
-            // start the foreground service can still chat and read the map.
+/// Register the location-service plugin.
+///
+/// Not essential to launch: an app that cannot start the foreground service can
+/// still chat and read the map, so a registration failure is logged and ignored.
+/// Kept as its own plugin so it cannot replace the keystore registration.
+pub fn init_location<R: Runtime>() -> TauriPlugin<R> {
+    PluginBuilder::new(LOCATION_PLUGIN_NAME)
+        .setup(|app, api| {
             match api.register_android_plugin(ANDROID_PACKAGE, LOCATION_PLUGIN_CLASS) {
                 Ok(location_handle) => {
                     app.manage(LocationServiceHandle::new(location_handle));
@@ -241,7 +282,6 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
                     );
                 }
             }
-
             Ok(())
         })
         .build()

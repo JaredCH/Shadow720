@@ -215,6 +215,18 @@ pub trait Keystore: Send + Sync {
 
     /// Stable identifier for the device key, for diagnostics only.
     fn key_alias(&self) -> String;
+
+    /// Destroy the device key so the next wrap generates a fresh one.
+    ///
+    /// Called by the vault reset. Without it, a key that is present but unusable
+    /// (rather than absent) would keep failing every subsequent wrap, and the
+    /// reset would loop forever instead of recovering.
+    ///
+    /// The default is a no-op: DPAPI has no key to delete, and the in-memory
+    /// double is discarded with the process.
+    fn delete_key(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Windows DPAPI binds the wrapped password to the current Windows user.
@@ -837,20 +849,26 @@ impl SecureVault {
     pub fn wipe(&self) -> Result<()> {
         // Drop plaintext first, so a failed unlink cannot leave secrets in memory.
         *self.contents.lock() = None;
+        Self::wipe_dir(&self.dir)?;
+        *self.descriptor.lock() = None;
+        Ok(())
+    }
 
-        for path in [
-            self.vault_path(),
-            self.wrapped_password_path(),
-            self.descriptor_path(),
-        ] {
+    /// Delete every vault file in `dir` without needing an open vault.
+    ///
+    /// The reset path cannot go through [`SecureVault::open`]: the vault is
+    /// unopenable, which is precisely why the user is resetting it. Deleting by
+    /// filename is the only way to break that deadlock.
+    pub fn wipe_dir(dir: impl AsRef<Path>) -> Result<()> {
+        let dir = dir.as_ref();
+        for name in [VAULT_FILENAME, WRAP_FILENAME, DESCRIPTOR_FILENAME] {
+            let path = dir.join(name);
             if path.exists() {
                 std::fs::remove_file(&path).map_err(|e| {
                     AppError::io("deleting a vault file", format!("{}: {e}", path.display()))
                 })?;
             }
         }
-
-        *self.descriptor.lock() = None;
         Ok(())
     }
 
@@ -1931,6 +1949,42 @@ mod tests {
         let keystore: Arc<dyn Keystore> = Arc::new(InMemoryKeystore::new().expect("keystore"));
         let vault = SecureVault::create(&dir, keystore).expect("create");
         vault.wipe().expect("wipe");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wipe_dir_removes_an_unopenable_vault() {
+        // The reset path: the device key is gone, so `open` fails and there is no
+        // `SecureVault` to call `wipe` on. Deleting by filename must still work.
+        let dir = scratch("wipedir");
+        let keystore: Arc<dyn Keystore> = Arc::new(InMemoryKeystore::new().expect("keystore"));
+        let vault = SecureVault::create(&dir, keystore).expect("create");
+        vault
+            .store_contents(&contents(), &descriptor_for("o/r"))
+            .expect("store");
+        drop(vault);
+
+        let invalidated: Arc<dyn Keystore> = Arc::new(InMemoryKeystore::invalidated());
+        assert!(
+            SecureVault::open(&dir, invalidated).is_err(),
+            "precondition: the vault must be unopenable"
+        );
+
+        SecureVault::wipe_dir(&dir).expect("wipe_dir");
+        assert!(!SecureVault::exists(&dir), "the marker file must be gone");
+        assert!(!dir.join(VAULT_FILENAME).exists());
+        assert!(!dir.join(DESCRIPTOR_FILENAME).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wipe_dir_is_idempotent_and_tolerates_a_missing_directory() {
+        let dir = scratch("wipedirmissing");
+        SecureVault::wipe_dir(&dir).expect("empty directory");
+        SecureVault::wipe_dir(&dir).expect("second call");
+        SecureVault::wipe_dir(dir.join("does-not-exist")).expect("absent directory");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

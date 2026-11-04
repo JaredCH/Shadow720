@@ -125,52 +125,6 @@ export default function App() {
     }
   }, []);
 
-  // -- bootstrap -------------------------------------------------------------
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const start = async () => {
-      try {
-        // The vault directory is provided by the shell at runtime; the Rust side
-        // treats it as opaque, so the browser preview simply lacks one.
-        const vaultDir = await resolveVaultDir();
-        const unlocked = await api.unlockVault({ vaultDir });
-
-        if (cancelled) return;
-
-        if (unlocked.requiresRecovery) {
-          setPhase("legacy-recovery");
-        } else if (unlocked.groupConfigured) {
-          if (await api.checkGroupClosed()) {
-            await finishClosedGroup("The host closed this group. Its local vault was wiped; copies on relays and other devices may remain.");
-            return;
-          }
-          await loadGroupState();
-          setPhase("ready");
-        } else {
-          setPhase("needs-consent");
-        }
-      } catch (thrown) {
-        if (cancelled) return;
-        const error = api.toAppError(thrown);
-        if (error.kind === "not_configured") {
-          // No native runtime: show the consent flow so the UI is explorable.
-          setPhase("needs-consent");
-          setBanner(error);
-          return;
-        }
-        setFatalError(error);
-        setPhase("failed");
-      }
-    };
-
-    void start();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
   const loadGroupState = useCallback(async () => {
     const [rosterSnapshot, chatSnapshot, info] = await Promise.all([
       api.rosterSnapshot(),
@@ -198,6 +152,50 @@ export default function App() {
 
     setGroups(await api.listGroups());
   }, []);
+
+  /**
+   * Open the vault and route to the right phase.
+   *
+   * Extracted from the mount effect so the reset flow can reuse it: wiping the
+   * vault leaves no open handle, so the only way forward is to unlock again.
+   */
+  const bootstrap = useCallback(async () => {
+    try {
+      // The vault directory is provided by the shell at runtime; the Rust side
+      // treats it as opaque, so the browser preview simply lacks one.
+      const vaultDir = await resolveVaultDir();
+      const unlocked = await api.unlockVault({ vaultDir });
+
+      if (unlocked.requiresRecovery) {
+        setPhase("legacy-recovery");
+      } else if (unlocked.groupConfigured) {
+        if (await api.checkGroupClosed()) {
+          await finishClosedGroup("The host closed this group. Its local vault was wiped; copies on relays and other devices may remain.");
+          return;
+        }
+        await loadGroupState();
+        setPhase("ready");
+      } else {
+        setPhase("needs-consent");
+      }
+    } catch (thrown) {
+      const error = api.toAppError(thrown);
+      if (error.kind === "not_configured") {
+        // No native runtime: show the consent flow so the UI is explorable.
+        setPhase("needs-consent");
+        setBanner(error);
+        return;
+      }
+      setFatalError(error);
+      setPhase("failed");
+    }
+  }, [finishClosedGroup, loadGroupState]);
+
+  // -- bootstrap -------------------------------------------------------------
+
+  useEffect(() => {
+    void bootstrap();
+  }, [bootstrap]);
 
   /** Switch to another stored group and reload everything for it. */
   const handleSwitchGroup = useCallback(async (groupId: string) => {
@@ -714,10 +712,14 @@ export default function App() {
               onCancel={() => setConfirmVaultReset(false)}
               onConfirm={() => void (async () => {
                 try {
-                  await api.resetVault();
+                  // The vault is not open here: unlocking is what failed. Pass the
+                  // directory explicitly, then re-run the bootstrap so the app
+                  // lands on a fresh vault instead of the same error screen.
+                  await api.resetVault(await resolveVaultDir());
                   setConfirmVaultReset(false);
                   setFatalError(null);
-                  setPhase("needs-consent");
+                  setPhase("starting");
+                  await bootstrap();
                 } catch (thrown) {
                   setFatalError(api.toAppError(thrown));
                   setConfirmVaultReset(false);

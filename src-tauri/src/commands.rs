@@ -779,16 +779,63 @@ pub async fn unlock_vault(
     })
 }
 
+/// Request to delete the local vault.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetVaultRequest {
+    /// Directory holding the vault files.
+    ///
+    /// Required in practice: the reset button only appears after `unlock_vault`
+    /// failed, so there is no open vault to ask for its directory. Optional so an
+    /// already-open vault can still be reset without repeating the path.
+    #[serde(default)]
+    pub vault_dir: Option<PathBuf>,
+}
+
 /// Delete the local vault so an unreadable one can be replaced.
 ///
 /// This is the only escape from a vault whose device key was invalidated: the
 /// password can never be unwrapped again, so the file is dead weight that blocks
 /// the app from starting. Nothing remote is touched.
+///
+/// Deliberately does *not* go through [`AppState::vault`]: that requires an open
+/// vault, and the whole point of this command is the case where opening failed.
 #[tauri::command]
-pub fn reset_vault(state: State<'_, AppState>) -> Result<()> {
-    let vault = state.vault()?;
-    vault.wipe()?;
+pub fn reset_vault(
+    state: State<'_, AppState>,
+    keystore: State<'_, Arc<dyn crate::vault::Keystore>>,
+    request: Option<ResetVaultRequest>,
+) -> Result<()> {
+    reset_vault_inner(&state, &keystore, request)
+}
+
+fn reset_vault_inner(
+    state: &AppState,
+    keystore: &Arc<dyn crate::vault::Keystore>,
+    request: Option<ResetVaultRequest>,
+) -> Result<()> {
+    let open = state.vault.read().clone();
+    let dir = request
+        .and_then(|request| request.vault_dir)
+        .or_else(|| open.as_ref().map(|vault| vault.dir().to_path_buf()))
+        .ok_or_else(|| {
+            AppError::invalid_argument("the vault directory is required to reset the vault")
+        })?;
+
+    // Drop the in-memory handle first so nothing can re-persist the files we are
+    // about to delete.
+    *state.vault.write() = None;
     *state.group.write() = None;
+
+    SecureVault::wipe_dir(&dir)?;
+
+    // A key that is present but unusable would fail every future wrap, so the
+    // reset must remove it too. Best-effort: the files are already gone, and
+    // reporting a key-deletion failure would leave the user stuck on the error
+    // screen with nothing left to reset.
+    if let Err(error) = keystore.delete_key() {
+        eprintln!("warning: the device key could not be deleted during reset: {error}");
+    }
     Ok(())
 }
 
@@ -3050,6 +3097,76 @@ mod tests {
     fn oauth_client_id_is_never_empty() {
         let id = oauth_client_id().expect("client id");
         assert!(!id.trim().is_empty());
+    }
+
+    #[test]
+    fn reset_vault_works_while_the_vault_is_locked() {
+        // Regression: `reset_vault` used to call `state.vault()`, which fails when
+        // no vault is open. The reset button only appears after unlocking failed,
+        // so the command always returned "the secure vault is locked" and the user
+        // was bounced straight back to the same error screen.
+        let dir = std::env::temp_dir().join(format!("shadow720-reset-{}", uuid::Uuid::new_v4()));
+        let keystore: Arc<dyn crate::vault::Keystore> =
+            Arc::new(crate::vault::InMemoryKeystore::new().expect("keystore"));
+        let vault = SecureVault::create(&dir, keystore).expect("create");
+        vault
+            .store_contents(
+                &VaultContents { pat: "github_pat_TEST".into(), group_key: Zeroizing::new([7; 32]) },
+                &VaultDescriptor {
+                    version: DESCRIPTOR_VERSION,
+                    keystore_alias: vault.keystore_alias(),
+                    repo_full_name: "o/r".into(),
+                    current_epoch: 0,
+                },
+            )
+            .expect("store");
+        drop(vault);
+
+        let state = AppState::new();
+        assert!(state.vault.read().is_none(), "precondition: nothing is open");
+
+        let keystore: Arc<dyn crate::vault::Keystore> =
+            Arc::new(crate::vault::InMemoryKeystore::new().expect("keystore"));
+        reset_vault_inner(
+            &state,
+            &keystore,
+            Some(ResetVaultRequest { vault_dir: Some(dir.clone()) }),
+        )
+        .expect("reset must not require an open vault");
+
+        assert!(!SecureVault::exists(&dir), "the vault files must be gone");
+        assert!(state.group.read().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_vault_requires_a_directory_when_nothing_is_open() {
+        let state = AppState::new();
+        let keystore: Arc<dyn crate::vault::Keystore> =
+            Arc::new(crate::vault::InMemoryKeystore::new().expect("keystore"));
+        let error = reset_vault_inner(&state, &keystore, None).expect_err("no directory");
+        assert_eq!(error.kind(), crate::error::AppErrorKind::InvalidArgument);
+    }
+
+    #[test]
+    fn reset_vault_falls_back_to_the_open_vault_directory() {
+        let dir = std::env::temp_dir().join(format!("shadow720-resetopen-{}", uuid::Uuid::new_v4()));
+        let keystore: Arc<dyn crate::vault::Keystore> =
+            Arc::new(crate::vault::InMemoryKeystore::new().expect("keystore"));
+        let vault = Arc::new(SecureVault::create(&dir, keystore).expect("create"));
+
+        let state = AppState::new();
+        *state.vault.write() = Some(vault);
+
+        let keystore: Arc<dyn crate::vault::Keystore> =
+            Arc::new(crate::vault::InMemoryKeystore::new().expect("keystore"));
+        reset_vault_inner(&state, &keystore, None).expect("reset via the open handle");
+
+        assert!(!SecureVault::exists(&dir));
+        assert!(state.vault.read().is_none(), "the handle must be dropped");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -122,6 +122,28 @@ class KeystoreVaultPlugin(private val activity: android.app.Activity) : Plugin(a
         }
     }
 
+    /**
+     * Delete the wrapping key.
+     *
+     * Used only by the vault reset. A key that is present but unusable (for
+     * example after a lock-screen change on a device that later dropped the
+     * credential) cannot be repaired, so the reset has to remove it; otherwise
+     * every subsequent wrap would fail and the reset would never recover.
+     */
+    @Command
+    fun deleteKey(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(WrapArgs::class.java)
+            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            if (keyStore.containsAlias(args.alias)) {
+                keyStore.deleteEntry(args.alias)
+            }
+            invoke.resolve(app.tauri.plugin.JSObject().put("deleted", true))
+        } catch (error: Exception) {
+            invoke.reject(describe(error))
+        }
+    }
+
     @Command
     fun isKeyAvailable(invoke: Invoke) {
         try {
