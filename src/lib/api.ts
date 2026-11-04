@@ -415,6 +415,14 @@ export const unlockVault = (request: UnlockRequest) =>
 
 export const discardLegacyGroup = () => call<void>("discard_legacy_group");
 
+/**
+ * Delete the local vault so an unreadable one can be replaced.
+ *
+ * The only escape from a vault whose device key was invalidated. Nothing remote
+ * is touched.
+ */
+export const resetVault = () => call<void>("reset_vault");
+
 /** A group this device belongs to, with no secrets. */
 export interface GroupSummary {
   id: string;
@@ -653,7 +661,10 @@ export function describeError(error: AppError): string {
     case "rate_limited":
       return "GitHub rate limit reached. Sync resumes automatically; no action needed.";
     case "vault_unavailable":
-      return "The secure vault cannot be opened on this device, so a fresh invite is required.";
+      // The underlying message distinguishes a genuinely invalidated device key
+      // from a keystore or filesystem failure. Replacing it with one generic
+      // sentence made every vault problem look like a factory reset.
+      return `The secure vault cannot be opened on this device: ${error.message}`;
     case "payload_too_large":
       return "That file is too large to share. The limit is 15 MB.";
     case "github_api":

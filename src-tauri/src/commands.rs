@@ -779,6 +779,19 @@ pub async fn unlock_vault(
     })
 }
 
+/// Delete the local vault so an unreadable one can be replaced.
+///
+/// This is the only escape from a vault whose device key was invalidated: the
+/// password can never be unwrapped again, so the file is dead weight that blocks
+/// the app from starting. Nothing remote is touched.
+#[tauri::command]
+pub fn reset_vault(state: State<'_, AppState>) -> Result<()> {
+    let vault = state.vault()?;
+    vault.wipe()?;
+    *state.group.write() = None;
+    Ok(())
+}
+
 /// Every group this device belongs to, for the switcher.
 #[tauri::command]
 pub fn list_groups(state: State<'_, AppState>) -> Result<Vec<crate::vault::GroupSummary>> {

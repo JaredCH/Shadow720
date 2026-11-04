@@ -138,6 +138,7 @@ pub fn run() {
         .manage(commands::AppState::new())
         .invoke_handler(tauri::generate_handler![
             commands::unlock_vault,
+            commands::reset_vault,
             commands::list_groups,
             commands::switch_group,
             commands::forget_group,

@@ -87,6 +87,7 @@ export default function App() {
     pubkey: string;
   } | null>(null);
   const [confirmLegacyDiscard, setConfirmLegacyDiscard] = useState(false);
+  const [confirmVaultReset, setConfirmVaultReset] = useState(false);
 
   // Timers are held in refs so the loops cannot stack up across renders.
   const chatTimer = useRef<number | null>(null);
@@ -691,9 +692,38 @@ export default function App() {
           </p>
           {fatalError?.kind === "vault_unavailable" ? (
             <p className="text-xs text-slate-500">
-              This usually means the device key changed, for example after a factory
-              reset. Join the group again with a fresh invite.
+              If the device key was invalidated, for example by a factory reset, the
+              old vault cannot be recovered. Resetting removes the unreadable local
+              vault so a fresh invite can be used.
             </p>
+          ) : null}
+          {fatalError?.kind === "vault_unavailable" ? (
+            <button
+              type="button"
+              className="btn-danger w-full"
+              onClick={() => setConfirmVaultReset(true)}
+            >
+              Reset local vault
+            </button>
+          ) : null}
+          {confirmVaultReset ? (
+            <ConfirmSheet
+              title="Reset the local vault?"
+              body="The unreadable vault on this device will be deleted. Any group you were in must be rejoined with a fresh invite; nothing on the relays or other devices is affected."
+              confirmLabel="Reset vault"
+              onCancel={() => setConfirmVaultReset(false)}
+              onConfirm={() => void (async () => {
+                try {
+                  await api.resetVault();
+                  setConfirmVaultReset(false);
+                  setFatalError(null);
+                  setPhase("needs-consent");
+                } catch (thrown) {
+                  setFatalError(api.toAppError(thrown));
+                  setConfirmVaultReset(false);
+                }
+              })()}
+            />
           ) : null}
         </div>
       </Shell>
