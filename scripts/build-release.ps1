@@ -80,7 +80,10 @@ if (-not $SkipAndroid) {
 
     Push-Location (Join-Path $root 'src-tauri')
     try {
-        cargo build --release --target aarch64-linux-android
+        # `custom-protocol` is what makes this a production build. Without it Tauri
+        # compiles in dev mode, points the webview at build.devUrl, and leaves the
+        # frontend out of the binary entirely.
+        cargo build --release --target aarch64-linux-android --features custom-protocol
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
 
         # Gradle's rustBuild task re-invokes the Tauri CLI, which needs Developer

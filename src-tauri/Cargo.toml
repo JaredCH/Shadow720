@@ -72,6 +72,11 @@ tokio = { version = "1", features = ["full"] }
 [features]
 # Enables the live `jaredch` integration suite. Requires SHADOWTEST_PAT + SHADOWTEST_REPO.
 live-tests = []
+# Tauri treats a build without this feature as a dev build: it points the webview
+# at `build.devUrl` and skips embedding the frontend. `tauri build` enables it
+# automatically, but a direct `cargo build --release` does not, which produced a
+# release APK that tried to reach localhost:1420 on the phone.
+custom-protocol = ["tauri/custom-protocol"]
 
 [profile.release]
 codegen-units = 1
