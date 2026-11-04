@@ -25,7 +25,9 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 release="$root/release"
 mkdir -p "$release"
 
-version="$(sed -n 's/^  "version": "\(.*\)",$/\1/p' "$root/package.json" | head -1)"
+# Strip a trailing CR so the script works whether package.json uses LF or CRLF
+# line endings (a Windows checkout keeps CRLF, which breaks a plain `$` match).
+version="$(sed -n 's/^  "version": "\(.*\)",\r\?$/\1/p' "$root/package.json" | head -1)"
 if [[ -z "$version" ]]; then
     echo "could not read the version from package.json" >&2
     exit 1

@@ -146,7 +146,7 @@ export function ChatDrawer({
   };
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="mx-auto flex h-full w-full max-w-3xl flex-col">
       <div ref={listRef} className="min-h-0 flex-1 space-y-2 overflow-y-auto pb-3">
         {items.length === 0 ? (
           <p className="card text-center text-sm text-slate-400">

@@ -42,7 +42,7 @@ type Tab = "map" | "chat" | "settings";
  * Poll loop intervals come from the Rust side, which owns the rate-limit policy.
  * These are only floors, used if a command returns something implausible.
  */
-const MIN_CHAT_DELAY_MS = 2_000;
+const MIN_CHAT_DELAY_MS = 1_000;
 
 /**
  * Build version, shown on the failure screen.
@@ -50,11 +50,11 @@ const MIN_CHAT_DELAY_MS = 2_000;
  * Without it there is no way to tell which APK is installed, which made a
  * report of an already-fixed bug indistinguishable from a new one.
  */
-const APP_VERSION = "0.1.3";
-const MIN_ROSTER_DELAY_MS = 5_000;
+const APP_VERSION = "0.1.6";
+const MIN_ROSTER_DELAY_MS = 3_000;
 
 /** How often to refresh the local GPS fix while the map tab is visible. */
-const FIX_INTERVAL_MS = 20_000;
+const FIX_INTERVAL_MS = 10_000;
 
 export default function App() {
   const [phase, setPhase] = useState<Phase>("starting");
@@ -877,7 +877,9 @@ export default function App() {
 
   return (
     <Shell>
-      <div className="flex h-full flex-col">
+      <div className="flex h-full">
+        <Sidebar tab={tab} onSelect={setTab} chatCount={chat.length} />
+        <div className="flex h-full min-w-0 flex-1 flex-col">
         <header className="border-b border-surface-border px-4 pb-3 pt-[max(0.75rem,env(safe-area-inset-top))]">
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
@@ -945,7 +947,7 @@ export default function App() {
           </div>
         ) : null}
 
-        <main className="min-h-0 flex-1 px-4 pt-3">
+        <main className="min-h-0 flex-1 px-4 pt-3 lg:px-6">
           {tab === "map" ? (
             <MapPanel
               members={roster}
@@ -1016,25 +1018,26 @@ export default function App() {
           ) : null}
         </main>
 
-        <nav className="grid grid-cols-3 border-t border-surface-border pb-[env(safe-area-inset-bottom)]">
-          {(["map", "chat", "settings"] as const).map((option) => (
+        <nav className="grid grid-cols-3 border-t border-surface-border pb-[env(safe-area-inset-bottom)] lg:hidden">
+          {TABS.map((option) => (
             <button
-              key={option}
+              key={option.id}
               type="button"
-              onClick={() => setTab(option)}
+              onClick={() => setTab(option.id)}
               className={`py-3 text-xs font-semibold capitalize transition-colors ${
-                tab === option
+                tab === option.id
                   ? "text-accent"
                   : "text-slate-500 hover:text-slate-300"
               }`}
             >
-              {option}
-              {option === "chat" && chat.length > 0 ? (
+              {option.label}
+              {option.id === "chat" && chat.length > 0 ? (
                 <span className="ml-1 text-[10px] text-slate-600">{chat.length}</span>
               ) : null}
             </button>
           ))}
         </nav>
+        </div>
       </div>
 
       {showGroups ? (
@@ -1186,14 +1189,68 @@ export default function App() {
   );
 }
 
-/** App chrome: a phone-shaped column on wide screens, full-bleed on a phone. */
+/**
+ * App chrome: a phone-shaped column on narrow screens, a full-width desktop
+ * surface on wide screens. The ready view adds its own sidebar on `lg+`.
+ */
 function Shell({ children }: { children: React.ReactNode }) {
   return (
     <div className="flex h-full justify-center bg-slate-950">
-      <div className="flex h-full w-full max-w-md flex-col overflow-hidden bg-surface">
+      <div className="flex h-full w-full max-w-md flex-col overflow-hidden bg-surface lg:max-w-none">
         {children}
       </div>
     </div>
+  );
+}
+
+/** The three top-level destinations, shared by the desktop sidebar and the mobile tab bar. */
+const TABS: { id: Tab; label: string }[] = [
+  { id: "map", label: "Map" },
+  { id: "chat", label: "Chat" },
+  { id: "settings", label: "Settings" },
+];
+
+/** Desktop left-hand navigation rail. */
+function Sidebar({
+  tab,
+  onSelect,
+  chatCount,
+}: {
+  tab: Tab;
+  onSelect: (tab: Tab) => void;
+  chatCount: number;
+}) {
+  return (
+    <aside className="hidden w-56 shrink-0 flex-col border-r border-surface-border bg-surface-raised/40 lg:flex">
+      <div className="border-b border-surface-border px-4 py-4">
+        <h1 className="text-sm font-semibold text-slate-100">Shadow720</h1>
+        <p className="mt-0.5 text-[10px] text-slate-500">E2EE · no server</p>
+      </div>
+      <nav className="flex flex-col gap-1 p-2">
+        {TABS.map((option) => (
+          <button
+            key={option.id}
+            type="button"
+            onClick={() => onSelect(option.id)}
+            className={`flex items-center justify-between rounded-xl px-3 py-2.5 text-sm font-semibold transition-colors ${
+              tab === option.id
+                ? "bg-accent/15 text-accent"
+                : "text-slate-400 hover:bg-surface-raised hover:text-slate-200"
+            }`}
+          >
+            <span>{option.label}</span>
+            {option.id === "chat" && chatCount > 0 ? (
+              <span className="rounded-full bg-accent/20 px-2 py-0.5 text-[10px] text-accent">
+                {chatCount}
+              </span>
+            ) : null}
+          </button>
+        ))}
+      </nav>
+      <div className="mt-auto px-4 py-3 text-[10px] text-slate-600">
+        v{APP_VERSION}
+      </div>
+    </aside>
   );
 }
 
@@ -1270,7 +1327,7 @@ function GroupSetup({
   onCreateNostr,
   onJoin,
 }: GroupSetupProps) {
-  const [mode, setMode] = useState<"join" | "create">("join");
+  const [mode, setMode] = useState<"join" | "create">("create");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<AppError | null>(null);
 
@@ -1280,7 +1337,7 @@ function GroupSetup({
   const [displayName, setDisplayName] = useState("");
 
   // Create fields.
-  const [provider, setProvider] = useState<ProviderId>("github");
+  const [provider, setProvider] = useState<ProviderId>("nostr");
   const [provision, setProvision] = useState(true);
   const [signedIn, setSignedIn] = useState<api.SignInResponse | null>(null);
   const [allowDestroy, setAllowDestroy] = useState(false);

@@ -153,7 +153,7 @@ export function SettingsPanel({
   };
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="mx-auto flex h-full w-full max-w-3xl flex-col">
       <div className="mb-3 flex items-center justify-between">
         <h2 className="text-base font-semibold text-slate-100">Settings</h2>
         <button

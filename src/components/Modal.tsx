@@ -54,7 +54,7 @@ export function Modal({
       onClick={blocking ? undefined : onSecondary}
     >
       <div
-        className="w-full max-w-md rounded-t-3xl border-t border-surface-border bg-surface-raised p-5 pb-7 shadow-2xl"
+        className="w-full max-w-md rounded-t-3xl border-t border-surface-border bg-surface-raised p-5 pb-7 shadow-2xl lg:max-w-lg lg:rounded-2xl"
         onClick={(event) => event.stopPropagation()}
       >
         <h2 className="mb-3 text-base font-semibold text-slate-100">{title}</h2>

@@ -29,9 +29,12 @@ use crate::geo_filter::{
 use crate::github_db::{GitHubClient, IssueComment, RepoRef};
 
 /// Poll cadence for the chat channel, from `PLAN_ADDENDUM_v1.md` §A5.
-pub const CHAT_INTERVAL_SECS: u64 = 10;
+///
+/// Nostr relays push over WebSocket and there is no shared request budget, so
+/// the cadence can be tighter than the GitHub path allowed.
+pub const CHAT_INTERVAL_SECS: u64 = 5;
 /// Poll cadence for the roster channel.
-pub const ROSTER_INTERVAL_SECS: u64 = 30;
+pub const ROSTER_INTERVAL_SECS: u64 = 15;
 /// A roster comment older than this is treated as a stale/offline member.
 pub const MEMBER_STALE_SECS: i64 = 300;
 /// A roster comment older than this is pruned from the UI entirely.
@@ -2444,17 +2447,17 @@ mod tests {
 
         let base = state.chat_delay(true).await;
         assert!(
-            base >= Duration::from_millis(7_500) && base <= Duration::from_millis(12_500),
-            "first delay should be 10 s ±25%, got {base:?}"
+            base >= Duration::from_millis(3_750) && base <= Duration::from_millis(6_250),
+            "first delay should be 5 s ±25%, got {base:?}"
         );
 
         state.chat_delay(true).await;
         state.chat_delay(true).await;
-        // After the third quiet poll the interval doubles to 20 s before jitter.
+        // After the third quiet poll the interval doubles to 10 s before jitter.
         let backed_off = state.chat_delay(true).await;
-        assert_eq!(state.chat_backoff.read().current(), Duration::from_secs(20));
+        assert_eq!(state.chat_backoff.read().current(), Duration::from_secs(10));
         assert!(
-            backed_off <= Duration::from_millis(25_000),
+            backed_off <= Duration::from_millis(12_500),
             "jitter must stay proportional: {backed_off:?}"
         );
     }

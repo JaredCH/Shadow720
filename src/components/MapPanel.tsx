@@ -135,27 +135,31 @@ export function MapPanel({
         </button>
       </div>
 
-      <div className="relative h-[46vh] min-h-[240px] overflow-hidden rounded-2xl border border-surface-border bg-surface">
-        <PeerMap
-          members={members}
-          selfFix={selfFix}
-          trails={trails}
-          anchor={anchor}
-          followSelf={followSelf}
-          selectedPubkey={selectedPubkey}
-          onSelect={onSelect}
-          basemap={basemap}
-          placeholderZoom={hasPosition ? undefined : 2}
-        />
+      <div className="flex min-h-0 flex-1 flex-col gap-3 lg:flex-row">
+        <div className="relative h-[46vh] min-h-[240px] overflow-hidden rounded-2xl border border-surface-border bg-surface lg:h-auto lg:min-h-0 lg:flex-1">
+          <PeerMap
+            members={members}
+            selfFix={selfFix}
+            trails={trails}
+            anchor={anchor}
+            followSelf={followSelf}
+            selectedPubkey={selectedPubkey}
+            onSelect={onSelect}
+            basemap={basemap}
+            placeholderZoom={hasPosition ? undefined : 2}
+          />
 
-        {!hasPosition ? (
-          <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-surface to-transparent p-4 text-center text-xs text-slate-400">
-            Waiting for the first location update. Pan and zoom to explore.
-          </div>
-        ) : null}
-      </div>
+          {!hasPosition ? (
+            <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-surface to-transparent p-4 text-center text-xs text-slate-400">
+              Waiting for the first location update. Pan and zoom to explore.
+            </div>
+          ) : null}
+        </div>
 
-      <div ref={listRef} className="min-h-0 flex-1 space-y-2 overflow-y-auto pb-2">
+        <div
+          ref={listRef}
+          className="min-h-0 flex-1 space-y-2 overflow-y-auto pb-2 lg:w-80 lg:flex-none lg:pb-0"
+        >
         {members.length === 0 ? (
           <p className="card text-center text-sm text-slate-400">
             Nobody has shared a position yet.
@@ -229,6 +233,7 @@ export function MapPanel({
             );
           })
         )}
+        </div>
       </div>
     </div>
   );

@@ -25,7 +25,13 @@
 | **See everyone, live** | **Talk without being read** | **Stay in control** |
 |:---:|:---:|:---:|
 | <img src="docs/screens/map.png" width="260" alt="Live map with four group members, activity badges, and travel trails" /> | <img src="docs/screens/chat.png" width="260" alt="Encrypted group chat with text and file messages" /> | <img src="docs/screens/settings.png" width="260" alt="Settings showing group diagnostics, members, and host controls" /> |
-| A real map, real trails, real activity — walking, cycling, driving — refreshed every 30 seconds. | Messages and files sealed on your phone before they leave it. | Key epochs, member roles, rotation, and a wipe button that actually wipes. |
+| A real map, real trails, real activity — walking, cycling, driving — refreshed every 15 seconds. | Messages and files sealed on your phone before they leave it. | Key epochs, member roles, rotation, and a wipe button that actually wipes. |
+
+**On desktop the app opens wide** — a 1260×720 window with a left-hand navigation rail, the map beside the member list, and a resizable layout that adapts to your screen.
+
+| **Desktop map** | **Desktop chat** | **Desktop settings** |
+|:---:|:---:|:---:|
+| <img src="docs/screens/desktop-map.png" width="420" alt="Wide desktop map with the member list beside the map and a left navigation rail" /> | <img src="docs/screens/desktop-chat.png" width="420" alt="Wide desktop chat with a left navigation rail" /> | <img src="docs/screens/desktop-settings.png" width="420" alt="Wide desktop settings with a left navigation rail" /> |
 
 </div>
 
@@ -58,16 +64,16 @@ There is nothing to host, so there is nothing to pay for. The storage is free-ti
 
 ## ⚠️ Right now, Nostr is the only working option
 
-The provider picker lists six backends. **Only Nostr is wired end to end today.** The others are shown with an explicit "soon" badge rather than hidden, so the app never promises something the backend cannot do.
+The provider picker lists six backends. **Only Nostr is wired end to end today.** The others are shown with an explicit "unavailable" state rather than hidden, so the app never promises something the backend cannot do.
 
 <div align="center">
-<img src="docs/screens/providers.png" width="300" alt="Provider picker listing GitHub, GitLab, Codeberg, Nostr, Radicle, and gitGost, with Nostr under No account required" />
+<img src="docs/screens/providers.png" width="300" alt="Provider picker listing Nostr as the only working option, with GitHub, GitLab, Codeberg, Radicle, and gitGost marked unavailable" />
 </div>
 
 | Provider | State | Why |
 |---|---|---|
 | **Nostr** | ✅ **The only working option** | Keypair identity, no signup, no token, no repository. Everything works: positions, chat, files, rotation, leaving. |
-| GitHub | ⚠️ Not working right now | Needs an account and a token, and the flow is being reworked. Do not rely on it. |
+| GitHub | ⚠️ Unavailable right now | Needs an account and a token, and the flow is being reworked. Do not rely on it. |
 | GitLab · Codeberg · Radicle · gitGost | ⏳ Soon | Backend not implemented. |
 
 **Why Nostr is the better default anyway:** identity is a keypair generated on your device, so there is no signup and no credential in the invite. Each member signs their own events, so a guest can only write their own roster slot — the "every guest can destroy the repo" problem simply does not exist. Relays push over WebSocket, so there is no polling.
@@ -92,13 +98,13 @@ The Android APK is signed with a self-signed key, so Android will ask you to all
 
 ```bash
 # Debian / Ubuntu / Mint
-sudo apt install ./Shadow720_0.1.5_amd64.deb
+sudo apt install ./Shadow720_0.1.6_amd64.deb
 
 # Fedora / RHEL / Rocky / Alma
-sudo dnf install ./Shadow720-0.1.5-1.x86_64.rpm
+sudo dnf install ./Shadow720-0.1.6-1.x86_64.rpm
 
 # Any distro, no install
-chmod +x Shadow720_0.1.5_amd64.AppImage && ./Shadow720_0.1.5_amd64.AppImage
+chmod +x Shadow720_0.1.6_amd64.AppImage && ./Shadow720_0.1.6_amd64.AppImage
 ```
 
 The Linux build needs WebKitGTK 4.1 (`libwebkit2gtk-4.1-0`), which the `.deb` and `.rpm` pull in automatically. The AppImage bundles it.
@@ -118,7 +124,7 @@ The vault password is wrapped by a 32-byte device key. On Linux that key lives i
 **Create a group**
 
 1. Open the app and accept the terms and location disclosure.
-2. Choose **Create a group** → **Nostr**.
+2. Choose **Create a group**. Nostr is selected by default — it is the only working backend.
 3. Enter a group name, a join password, and your display name.
 
 That's it. A keypair is generated on the device, the group key is sealed inside the invite, and you get a `GRP1-…` string to share.
@@ -138,6 +144,7 @@ Paste the invite string, enter the join password you were given separately, and 
 | Rust core | **415 unit tests**, all passing |
 | TypeScript UI | `tsc --noEmit` clean, production bundle builds |
 | Map | OpenStreetMap basemap, follows the OS light/dark theme, fading travel trails |
+| Desktop | Wide 1260×720 window, left navigation rail, map beside the member list, resizable |
 | Activity | Stationary / walking / running / cycling / driving, from reported speed |
 | Groups | Multiple groups per device, switchable offline |
 | Chat | Text, file pointers, per-message moderation, author-signed deletion |
@@ -208,6 +215,8 @@ Publishing every GPS fix would burn battery and flood relays, so the core gates 
 | `MIN_MOVE_METERS` | 15 m | below this, a fix is not worth publishing |
 | `MIN_INTERVAL_SECS` | 30 s | floor between publishes |
 | `HEARTBEAT_SECS` | 900 s | publish anyway every 15 min so a still member stays fresh |
+| `CHAT_INTERVAL_SECS` | 5 s | chat poll cadence (Nostr is push-based, so this is safe) |
+| `ROSTER_INTERVAL_SECS` | 15 s | roster poll cadence |
 | `JITTER_FRACTION` | ±25% | so 50 phones never align into a thundering herd |
 | `BACKOFF_THRESHOLD` / `FACTOR` / `CAP` | 3 / 2.0× / 300 s | adaptive backoff when a relay stops answering |
 | `RATE_LIMIT_PADDING_SECS` | 60 s | extra wait past a reported rate-limit reset |

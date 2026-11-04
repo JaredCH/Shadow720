@@ -34,7 +34,20 @@ export interface ProviderOption {
 
 export const PROVIDER_GROUPS: { title: string; items: ProviderOption[] }[] = [
   {
-    title: "Sign in with one button",
+    title: "No account required",
+    items: [
+      {
+        id: "nostr",
+        label: "Nostr",
+        blurb:
+          "Identity is a keypair generated on this device. No signup, no token, and the invite carries no credential.",
+        requiresAccount: false,
+        available: true,
+      },
+    ],
+  },
+  {
+    title: "Account backends",
     items: [
       {
         id: "github",
@@ -42,7 +55,9 @@ export const PROVIDER_GROUPS: { title: string; items: ProviderOption[] }[] = [
         blurb:
           "Private repo, issues, and release assets. Sign in and the app builds everything.",
         requiresAccount: true,
-        available: true,
+        available: false,
+        unavailableReason:
+          "The GitHub flow is being reworked. Use Nostr to create a group now.",
       },
       {
         id: "gitlab",
@@ -59,19 +74,6 @@ export const PROVIDER_GROUPS: { title: string; items: ProviderOption[] }[] = [
         requiresAccount: true,
         available: false,
         unavailableReason: "Backend not implemented yet.",
-      },
-    ],
-  },
-  {
-    title: "No account required",
-    items: [
-      {
-        id: "nostr",
-        label: "Nostr",
-        blurb:
-          "Identity is a keypair generated on this device. No signup, no token, and the invite carries no credential.",
-        requiresAccount: false,
-        available: true,
       },
       {
         id: "radicle",
@@ -95,7 +97,7 @@ export const PROVIDER_GROUPS: { title: string; items: ProviderOption[] }[] = [
   },
 ];
 
-/** Look up an option by id, falling back to GitHub. */
+/** Look up an option by id, falling back to Nostr. */
 export function providerById(id: ProviderId): ProviderOption {
   for (const group of PROVIDER_GROUPS) {
     for (const item of group.items) {
