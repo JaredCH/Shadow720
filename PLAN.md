@@ -1,5 +1,10 @@
 # PLAN.md — Serverless E2EE Android Group App
 
+> **Superseded.** This is the original design record, kept for history. The GitHub
+> backend it describes has been removed: Nostr relays are now the only storage path,
+> and there is no account, no token, and no repository. See [README.md](./README.md)
+> for how the app actually works today.
+
 Master plan. Original spec lives at [Shadow720/PLAN.md](../../../../Shadow720/PLAN.md); the review decisions are folded in below and also staged separately as [PLAN_ADDENDUM_v1.md](./PLAN_ADDENDUM_v1.md).
 
 **Target:** production-grade, 100% serverless Android app — Tauri v2 (Rust core + TypeScript/Vite UI), GitHub Issues + Release Assets as the database, Google Play Store ready.

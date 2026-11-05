@@ -1,5 +1,9 @@
 # PLAN_ADDENDUM_v1 — Locked Decisions from Review
 
+> **Superseded.** The GitHub provisioning and PAT decisions below no longer apply:
+> the GitHub backend has been removed and Nostr relays are the only storage path.
+> Kept for history. See [README.md](./README.md) for the current design.
+
 Supersedes / extends the numbered sections in [PLAN.md](../../../../Shadow720/PLAN.md). Where these conflict with PLAN.md, **this file wins**.
 
 ## A1. Repo & PAT Provisioning (extends §2.1)

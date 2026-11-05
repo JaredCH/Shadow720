@@ -66,25 +66,25 @@ There is nothing to host, so there is nothing to pay for. The storage is free-ti
 - **A month of history.** Every device keeps a 31-day track log, grouped by day and week, with distance, dominant activity, and lowest battery per day. It is sealed with the group key and never published.
 - **Activity that doesn't flicker.** A rolling median plus hysteresis means one bad GPS fix can no longer relabel a stationary member as "driving".
 - **Battery that actually works.** Level and charging state were hardcoded to `0`; they are now read from the platform and colour-coded, with a per-day low in the history view.
-- **Background location actually publishes.** The Android foreground service was broadcasting fixes that nothing received. It now forwards them to the core, so the pin keeps moving with the screen off.
+- **Background location survives the app closing.** The foreground service publishes straight into the Rust core over JNI instead of broadcasting to a webview that no longer exists, so the pin keeps moving with the screen off.
+- **Battery-efficient cadence.** The service asks Android for a fix only after a real distance, then widens the interval when you are stationary or the battery is low: 30 s moving, 10 s fast, 2 min still, 5 min on low battery.
+- **Play-compliant permissions.** `CAMERA` is gone, `POST_NOTIFICATIONS` is requested before background sharing starts, and the missing background-location grant is detected and routed to the settings page Android requires.
+- **Signed `.aab`.** The release build produces a Play bundle and syncs `versionCode` from `tauri.conf.json`, so it cannot ship a stale version.
 
 ---
 
-## ⚠️ Right now, Nostr is the only working option
+## Nostr is the only backend
 
-The provider picker lists six backends. **Only Nostr is wired end to end today.** The others are shown with an explicit "unavailable" state rather than hidden, so the app never promises something the backend cannot do.
+Identity is a keypair generated on your device, so there is no signup, no token, and
+no repository to create. Each member signs their own events, so a guest can only
+write their own roster slot — the "every guest can destroy the shared store" problem
+that a token-based backend has simply does not exist here.
 
-<div align="center">
-<img src="docs/screens/providers.png" width="300" alt="Provider picker listing Nostr as the only working option, with GitHub, GitLab, Codeberg, Radicle, and gitGost marked unavailable" />
-</div>
-
-| Provider | State | Why |
-|---|---|---|
-| **Nostr** | ✅ **The only working option** | Keypair identity, no signup, no token, no repository. Everything works: positions, chat, files, rotation, leaving. |
-| GitHub | ⚠️ Unavailable right now | Needs an account and a token, and the flow is being reworked. Do not rely on it. |
-| GitLab · Codeberg · Radicle · gitGost | ⏳ Soon | Backend not implemented. |
-
-**Why Nostr is the better default anyway:** identity is a keypair generated on your device, so there is no signup and no credential in the invite. Each member signs their own events, so a guest can only write their own roster slot — the "every guest can destroy the repo" problem simply does not exist. Relays push over WebSocket, so there is no polling.
+**Anyone can download the app, create a group, and invite whoever they like.** There
+is no central account, no allow-list, and no per-install provisioning: relays and
+Blossom servers default to built-in public lists, and a group is just a keypair plus
+a group key. Two different families using the app never touch each other's data and
+never need anything from us.
 
 ---
 
@@ -148,8 +148,7 @@ Paste the invite string, enter the join password you were given separately, and 
 ## What works
 
 | Area | State |
-|---|---|
-| Rust core | **438 unit tests**, all passing |
+| Rust core | **341 unit tests**, all passing |
 | TypeScript UI | `tsc --noEmit` clean, production bundle builds |
 | Map | OpenStreetMap basemap, follows the OS light/dark theme, fading travel trails with heading arrows |
 | Map focus | Tapping a name in the roster centres and zooms the map on that member |
@@ -341,17 +340,17 @@ src-tauri/
   src/nostr_store.rs      roster, chat, and blob storage on relays
   src/geo_filter.rs       movement gate, cadence, jitter, backoff, activity smoothing
   src/history.rs          month-long local track log, sealed with the group key
-  src/github_db.rs        ETag cache, comments, release assets, pruning
+  src/wire.rs             backend-neutral wire types shared with the command layer
   src/vault.rs            sealed vault + keystore trait
   src/group.rs            in-memory group state and policy
   src/commands.rs         the `#[tauri::command]` surface
   src/keystore_android.rs Android-only plugin bridge
+  src/android_bridge.rs   JNI entry point the location service publishes through
   gen/android/            generated Android project
     .../KeystoreVaultPlugin.kt        wraps the vault password in the Keystore
     .../LocationServicePlugin.kt      controls the foreground service
     .../LocationForegroundService.kt  the service itself
-docs/screens/             the screenshots in this README
-docs/play/                Play Store submission artefacts
+    .../NativePublisher.kt            JNI bridge into the Rust core
 ```
 
 ---
@@ -393,9 +392,10 @@ npm install
 npm run build         # typecheck, then vite build
 ```
 
-### Android APK
+### Android build
 
-`tauri android build` needs Windows Developer Mode for the symlink step. Without it, use this sequence, which is what the verified build used:
+`tauri android build` needs Windows Developer Mode for the symlink step. Without it,
+use this sequence, which is what the verified build used:
 
 ```powershell
 $env:ANDROID_HOME = "$env:LOCALAPPDATA\Android\Sdk"
@@ -403,7 +403,7 @@ $env:NDK_HOME    = "$env:LOCALAPPDATA\Android\Sdk\ndk\27.0.12077973"
 $env:JAVA_HOME   = "C:\Program Files\Eclipse Adoptium\jdk-21.0.12.101-hotspot"
 
 cd src-tauri
-cargo build --release --target aarch64-linux-android
+cargo build --release --target aarch64-linux-android --features custom-protocol
 
 $jni = "gen\android\app\src\main\jniLibs\arm64-v8a"
 New-Item -ItemType Directory -Force -Path $jni | Out-Null
@@ -418,13 +418,23 @@ Output: `src-tauri/gen/android/app/build/outputs/apk/arm64/debug/app-arm64-debug
 
 ### Release packages
 
-`scripts/build-release.ps1` produces the Windows and Android artifacts and stages them in `release/`:
+`scripts/build-release.ps1` produces the Windows and Play artifacts and stages them in
+`release/`:
 
 ```powershell
-.\scripts\build-release.ps1
+.\scripts\build-release.ps1            # Windows installers + signed .aab
+.\scripts\build-release.ps1 -ApkOnly   # sideloadable APK instead of the bundle
 ```
 
-It builds the Windows installer with `tauri build`, then the signed Android APK, and copies both into `release/`. The Android signing key is read from `src-tauri/gen/android/keystore.properties`, which is gitignored; without it the APK is unsigned and cannot be installed.
+It builds the Windows installer with `tauri build`, then the signed Android bundle,
+and copies both into `release/`. The Android signing key is read from
+`src-tauri/gen/android/keystore.properties`, which is gitignored; without it the
+bundle is unsigned and Play rejects the upload.
+
+The script also writes `versionCode` and `versionName` from `tauri.conf.json` into the
+gitignored `app/tauri.properties` before Gradle runs. Building through Gradle directly
+bypasses the Tauri CLI, which is what normally writes that file, so without this step
+the bundle silently ships a stale `versionCode` and Play rejects it as a duplicate.
 
 ### Linux packages
 
@@ -441,29 +451,10 @@ Build on the **oldest** distro you intend to support: the binary records the gli
 
 ---
 
-## Appendix: the GitHub backend
-
-Kept in the tree and still compiled, but not the supported path today. It is documented here so the code is not a mystery.
-
-GitHub Issues and Releases act as the database. Nothing is ever written to the Git tree, which is what avoids `409 Conflict` races and keeps `.git` history from growing with chat.
-
-| Logical table | GitHub primitive | Concurrency safety |
-|---|---|---|
-| Member roster + live location | Issue #1, one comment per member | each member only ever `PATCH`es **its own** comment id, so N phones never collide |
-| Group chat + file pointers | Issue #2 comments | append-only |
-| Encrypted file vault | `vault-v1` release assets | oldest-first pruning at a 500 MB ceiling |
-
-**Why sign-in instead of a pasted token:** fine-grained personal access tokens cannot be created through the API — GitHub has no endpoint for it, by design. Asking a user to open a browser, tick a dozen permission checkboxes, and paste a string back is exactly the setup step this app avoids. The OAuth device flow replaces it with one button: no client secret is involved, so the `client_id` is compiled in safely.
-
-The resulting token is account-scoped rather than repository-scoped. A repo-scoped fine-grained token needs `Contents: Read/Write`, `Issues: Read/Write`, and `Administration: Read/Write` (the last for in-app Destroy Group).
-
-> **The invite contains the token.** Anyone holding it can read the group and delete the repository. Rotation is the mitigation; it is called out in the privacy policy. This is the main reason Nostr is the default.
-
----
-
 ## Verifying the transport yourself
 
-The Nostr path has a self-test that exercises relay connect, publish, and read without touching the UI:
+The Nostr path has a self-test that exercises relay connect, publish, and read
+without touching the UI:
 
 ```powershell
 cd src-tauri
@@ -472,30 +463,25 @@ cargo run --example nostr_selftest
 
 ---
 
-## Testing against a live GitHub sandbox
-
-The live integration suite runs by default and reports skips when unconfigured. Copy [.env.example](./.env.example) to `.env` and fill in:
-
-```
-SHADOWTEST_PAT=<fine-grained token for a sandbox repo>
-SHADOWTEST_REPO=JaredCH/shadow720-sandbox
-SHADOWTEST_ALLOW_DESTRUCTIVE=0
-```
-
-Use a **throwaway sandbox repo**, never the primary group repo. The suite redacts the token from all output, asserts at least 500 requests remain before starting, and the destructive case refuses to run without `SHADOWTEST_ALLOW_DESTRUCTIVE=1`.
-
----
-
 ## Play Store submission
 
 | Artefact | File |
 |---|---|
-| Privacy policy | [docs/play/PRIVACY_POLICY.md](./docs/play/PRIVACY_POLICY.md) |
+| Privacy policy (public) | <https://jaredch.github.io/shadow720-legal/PRIVACY.md> |
+| Privacy policy (in-repo copy) | [docs/play/PRIVACY_POLICY.md](./docs/play/PRIVACY_POLICY.md) |
+| Terms of use (public) | <https://jaredch.github.io/shadow720-legal/TERMS.md> |
 | Field-by-field Console answers | [docs/play/PLAY_CONSOLE_ANSWERS.md](./docs/play/PLAY_CONSOLE_ANSWERS.md) |
 | Data safety worksheet | [docs/play/DATA_SAFETY_WORKSHEET.md](./docs/play/DATA_SAFETY_WORKSHEET.md) |
 | Background-location demo video plan | [docs/play/DEMO_VIDEO_SCRIPT.md](./docs/play/DEMO_VIDEO_SCRIPT.md) |
 
-Two placeholders must be filled before submitting: the contact address and the legal provider in the privacy policy.
+**No reviewer credentials are needed.** The app has no account system and no
+per-install provisioning, so a reviewer installs it, creates a group with a name and
+a password, and is immediately in a working group. There is nothing for us to hand
+over and nothing for them to be granted access to.
+
+The release artifact is a signed `.aab` built by [scripts/build-release.ps1](./scripts/build-release.ps1),
+which also syncs `versionCode` from `tauri.conf.json` so the bundle cannot ship a
+stale version.
 
 ---
 
@@ -517,13 +503,9 @@ Honest list. The app says these out loud rather than pretending otherwise.
 - **The map fetches OpenStreetMap tiles**, so the tile server sees the viewport coordinates being requested. Positions themselves stay encrypted; only the map area you are looking at is disclosed. The basemap follows the operating system's light or dark setting.
 - **Activity is inferred from reported speed**, not from a motion sensor. A device that reports no speed shows as stationary even while moving.
 - **Trails are local and short.** Each member's recent positions are kept in memory on this device only, capped at 60 points, and are not published or shared.
-- **`CAMERA` is declared but unused** until QR scanning ships. Remove it, or ship the feature, before release.
-- **Not yet run on a physical device.** Background location, the Keystore round trip, and the foreground-service notification are compiled and configured but unverified on hardware.
-
-**GitHub backend (not the supported path)**
-
-- **Every guest holds the host's token.** This is inherent to having no server. A guest can therefore delete any comment and destroy the repository.
-- **A re-key does not revoke the old token.** The host must revoke it on GitHub; the app only replaces its own copy.
+- **Background location is unverified on hardware.** The foreground service, the JNI
+  publish path, and the Keystore round trip are compiled and configured but have not
+  been exercised on a physical device.
 
 ---
 
