@@ -421,8 +421,30 @@ Output: `src-tauri/gen/android/app/build/outputs/apk/arm64/debug/app-arm64-debug
 
 ### Release packages
 
-`scripts/build-release.ps1` produces the Windows and Play artifacts and stages them in
-`release/`:
+First bump the version. Do not edit the version by hand:
+
+```powershell
+.\scripts\bump-version.ps1 -Version 0.1.9        # versionCode defaults to +1
+.\scripts\bump-version.ps1 -Version 0.2.0 -VersionCode 20 -DryRun
+```
+
+The version is declared in four files that must agree — `tauri.conf.json`,
+`package.json`, `Cargo.toml`, and the `shadow720` entry in `Cargo.lock` — plus the
+prose references in this README. Two ways of updating them are wrong and have both
+broken a build here:
+
+- **A blanket text replace** rewrites dependencies. `Cargo.lock` contains unrelated
+  crates whose versions happen to match the app's (`crypto-common` sat at `0.1.7`),
+  so replacing every occurrence makes cargo refuse to resolve.
+- **Parsing and re-serialising the JSON** reformats the whole file, turning a
+  one-line change into a ninety-line diff that buries the real edit.
+
+`bump-version.ps1` edits only the exact line that declares each version, then
+re-reads every file and asserts the diff is exactly the expected size — one line in
+`Cargo.lock`, two in `tauri.conf.json`, and so on. If a dependency moved or a file
+was reformatted, it fails loudly instead of leaving a landmine.
+
+Then build:
 
 ```powershell
 .\scripts\build-release.ps1            # Windows installers + signed .aab
