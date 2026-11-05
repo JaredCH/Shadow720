@@ -43,3 +43,8 @@ release/
 src-tauri/gen/android/*.jks
 src-tauri/gen/android/keystore.properties
 src-tauri/gen/android/app/src/main/jniLibs/
+
+# Demo recording intermediates (final cut is committed)
+demo/trimmed/
+demo/seg*.mp4
+demo/demo_part*.mp4
