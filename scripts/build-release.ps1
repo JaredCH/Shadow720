@@ -6,11 +6,14 @@
     Produces the artifacts that are actually shipped:
 
       * Windows  - NSIS installer and MSI, via `tauri build`
-      * Android  - signed arm64 AAB for Google Play, plus a sideloadable APK
+      * Android  - signed arm64 AAB for Google Play, and a signed arm64 APK
 
     Google Play requires an Android App Bundle (.aab) for new apps and for any
-    update that changes the signing key. The APK is still produced because it is
-    what a tester sideloads; it is not what gets uploaded.
+    update that changes the signing key. The APK is produced alongside it on every
+    run because it is what a tester sideloads and what a user installs outside
+    Play; shipping a release without one leaves those users with nothing to
+    install. Both are signed with the same key, so an APK and an AAB from one run
+    are interchangeable for the same versionCode.
 
     The bundle must be signed or Play rejects the upload. The signing key is read
     from src-tauri/gen/android/keystore.properties, which is gitignored; see
@@ -29,8 +32,8 @@
     Build only the Windows installers.
 
 .PARAMETER ApkOnly
-    Build the sideloadable APK instead of the Play bundle. Useful for testing on a
-    device without going through Play.
+    Build only the sideloadable APK, skipping the Play bundle. Useful for a quick
+    device test; a release run should not use this, because Play needs the .aab.
 #>
 [CmdletBinding()]
 param(
@@ -123,12 +126,15 @@ if (-not $SkipAndroid) {
 
         Push-Location 'gen\android'
         try {
+            # Both artifacts are built on every release run. The .aab is what Play
+            # accepts; the .apk is what a tester sideloads and what a user outside
+            # Play installs. Producing only one of them has already meant shipping
+            # a release with nothing installable for sideloaders.
             if ($ApkOnly) {
                 .\gradlew.bat assembleArm64Release -x rustBuildArm64Release
                 if ($LASTEXITCODE -ne 0) { throw "gradle failed with exit code $LASTEXITCODE" }
             } else {
-                # `bundleArm64Release` is what produces the .aab Play requires.
-                .\gradlew.bat bundleArm64Release -x rustBuildArm64Release
+                .\gradlew.bat bundleArm64Release assembleArm64Release -x rustBuildArm64Release
                 if ($LASTEXITCODE -ne 0) { throw "gradle failed with exit code $LASTEXITCODE" }
             }
         } finally {
@@ -138,18 +144,18 @@ if (-not $SkipAndroid) {
         Pop-Location
     }
 
-    if ($ApkOnly) {
-        $apk = Join-Path $root 'src-tauri\gen\android\app\build\outputs\apk\arm64\release\app-arm64-release.apk'
-        if (-not (Test-Path $apk)) { throw "Expected APK not found at $apk" }
-        $target = Join-Path $release "Shadow720_${version}_arm64.apk"
-        Copy-Item $apk $target -Force
-        Write-Host "  staged $(Split-Path -Leaf $target)"
-    } else {
+    $apk = Join-Path $root 'src-tauri\gen\android\app\build\outputs\apk\arm64\release\app-arm64-release.apk'
+    if (-not (Test-Path $apk)) { throw "Expected APK not found at $apk" }
+    $apkTarget = Join-Path $release "Shadow720_${version}_arm64.apk"
+    Copy-Item $apk $apkTarget -Force
+    Write-Host "  staged $(Split-Path -Leaf $apkTarget)"
+
+    if (-not $ApkOnly) {
         $aab = Join-Path $root 'src-tauri\gen\android\app\build\outputs\bundle\arm64Release\app-arm64-release.aab'
         if (-not (Test-Path $aab)) { throw "Expected AAB not found at $aab" }
-        $target = Join-Path $release "Shadow720_${version}_arm64.aab"
-        Copy-Item $aab $target -Force
-        Write-Host "  staged $(Split-Path -Leaf $target)"
+        $aabTarget = Join-Path $release "Shadow720_${version}_arm64.aab"
+        Copy-Item $aab $aabTarget -Force
+        Write-Host "  staged $(Split-Path -Leaf $aabTarget)"
     }
 }
 

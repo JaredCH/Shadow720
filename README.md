@@ -67,6 +67,7 @@ There is nothing to host, so there is nothing to pay for. The storage is free-ti
 - **You can see that sharing is deferred.** A banner reports how many positions are cached and offers a retry, and the settings panel shows the same count. A queued fix is not an error, so it no longer raises one.
 - **The cache is bounded and encrypted.** At most 512 fixes, nothing older than 24 hours, sealed with the group key beside the vault, and dropped when the vault is wiped. A device left offline for a week cannot grow it without bound.
 - **The displayed build version is correct again.** `APP_VERSION` had been left at `0.1.7` through the 0.1.8 release, so a bug report quoted the wrong build. The bump script now updates and verifies it like every other declaration.
+- **Every release now ships a signed APK.** The build script produced either the Play bundle or the sideloadable APK, never both, so a release could go out with nothing a user outside Play could install. Both are now built and attached on every run, signed with the same key and carrying the same `versionCode`.
 
 ### What's new in 0.1.9
 
@@ -106,12 +107,13 @@ Prebuilt packages are attached to each [release](../../releases):
 | Platform | File | Notes |
 |---|---|---|
 | Windows | `Shadow720_<version>_x64-setup.exe` | Installer; also `.msi` |
-| Android | `Shadow720_<version>_arm64.apk` | Android 8.0+ (API 26), arm64 |
+| Android (sideload) | `Shadow720_<version>_arm64.apk` | Android 8.0+ (API 26), arm64 |
+| Android (Play) | `Shadow720_<version>_arm64.aab` | Upload bundle; not installable directly |
 | Linux (Debian/Ubuntu) | `Shadow720_<version>_amd64.deb` | Ubuntu 22.04+, Debian 12+, Linux Mint 21+ |
 | Linux (Fedora/RHEL) | `Shadow720-<version>-1.x86_64.rpm` | Fedora 35+, RHEL/Rocky/Alma 9+ |
 | Linux (any distro) | `Shadow720_<version>_amd64.AppImage` | No install; `chmod +x` and run |
 
-The Android APK is signed with a self-signed key, so Android will ask you to allow installing from an unknown source. That is expected for an app distributed outside Play.
+The Android APK is signed with a self-signed key, so Android will ask you to allow installing from an unknown source. That is expected for an app distributed outside Play. The APK and the `.aab` are built from the same source with the same key and the same `versionCode`, so installing one over the other is a normal upgrade rather than a reinstall.
 
 **Installing on Linux**
 
@@ -449,10 +451,10 @@ First bump the version. Do not edit the version by hand:
 .\scripts\bump-version.ps1 -Version 0.2.0 -VersionCode 20 -DryRun
 ```
 
-The version is declared in four files that must agree — `tauri.conf.json`,
-`package.json`, `Cargo.toml`, and the `shadow720` entry in `Cargo.lock` — plus the
-prose references in this README. Two ways of updating them are wrong and have both
-broken a build here:
+The version is declared in five files that must agree — `tauri.conf.json`,
+`package.json`, `Cargo.toml`, the `shadow720` entry in `Cargo.lock`, and the
+`APP_VERSION` constant in `src/App.tsx` — plus the prose references in this README.
+Two ways of updating them are wrong and have both broken a build here:
 
 - **A blanket text replace** rewrites dependencies. `Cargo.lock` contains unrelated
   crates whose versions happen to match the app's (`crypto-common` sat at `0.1.7`),
@@ -461,19 +463,24 @@ broken a build here:
   one-line change into a ninety-line diff that buries the real edit.
 
 `bump-version.ps1` edits only the exact line that declares each version, then
-re-reads every file and asserts the diff is exactly the expected size — one line in
-`Cargo.lock`, two in `tauri.conf.json`, and so on. If a dependency moved or a file
-was reformatted, it fails loudly instead of leaving a landmine.
+re-reads every file and asserts the stronger invariant: every line that differs must
+differ *only* by the version token. That is what proves no dependency moved, and it
+stays correct when a file is already at the target version. If a dependency moved or
+a file was reformatted, it fails loudly instead of leaving a landmine.
 
 Then build:
 
 ```powershell
-.\scripts\build-release.ps1            # Windows installers + signed .aab
-.\scripts\build-release.ps1 -ApkOnly   # sideloadable APK instead of the bundle
+.\scripts\build-release.ps1            # Windows installers + signed .aab + signed .apk
+.\scripts\build-release.ps1 -ApkOnly   # APK only, for a quick device test
 ```
 
-It builds the Windows installer with `tauri build`, then the signed Android bundle,
-and copies both into `release/`. The Android signing key is read from
+It builds the Windows installer with `tauri build`, then the signed Android bundle
+**and** the signed APK, and copies all of them into `release/`. Both Android
+artifacts are produced on every release run: the `.aab` is what Play accepts, and the
+`.apk` is what a tester sideloads and what a user outside Play installs. They are
+signed with the same key and carry the same `versionCode`, so they are
+interchangeable for a given version. The Android signing key is read from
 `src-tauri/gen/android/keystore.properties`, which is gitignored; without it the
 bundle is unsigned and Play rejects the upload.
 
