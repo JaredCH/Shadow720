@@ -67,6 +67,9 @@ There is nothing to host, so there is nothing to pay for. The storage is free-ti
 - **Activity that doesn't flicker.** A rolling median plus hysteresis means one bad GPS fix can no longer relabel a stationary member as "driving".
 - **Battery that actually works.** Level and charging state were hardcoded to `0`; they are now read from the platform and colour-coded, with a per-day low in the history view.
 - **Background location survives the app closing.** The foreground service publishes straight into the Rust core over JNI instead of broadcasting to a webview that no longer exists, so the pin keeps moving with the screen off.
+- **Background location survives the app being killed.** Android restarts a sticky service in a fresh process where the Tauri bootstrap never runs. The service now opens the vault itself through the platform Keystore, so a low-memory kill no longer silently stops publishing.
+- **A stationary member no longer looks offline.** The heartbeat was 15 minutes while the staleness threshold was 5, so someone sitting still was drawn as offline for ten minutes out of every fifteen. The heartbeat is now 4 minutes.
+- **Slow movement is no longer invisible.** The platform distance filter equalled the core's movement gate, so a device drifting under 15 m never produced a fix and could never heartbeat. The filter is now 5 m, below the gate.
 - **Battery-efficient cadence.** The service asks Android for a fix only after a real distance, then widens the interval when you are stationary or the battery is low: 30 s moving, 10 s fast, 2 min still, 5 min on low battery.
 - **Play-compliant permissions.** `CAMERA` is gone, `POST_NOTIFICATIONS` is requested before background sharing starts, and the missing background-location grant is detected and routed to the settings page Android requires.
 - **Signed `.aab`.** The release build produces a Play bundle and syncs `versionCode` from `tauri.conf.json`, so it cannot ship a stale version.
@@ -505,7 +508,8 @@ Honest list. The app says these out loud rather than pretending otherwise.
 - **Trails are local and short.** Each member's recent positions are kept in memory on this device only, capped at 60 points, and are not published or shared.
 - **Background location is unverified on hardware.** The foreground service, the JNI
   publish path, and the Keystore round trip are compiled and configured but have not
-  been exercised on a physical device.
+  been exercised on a physical device. Test on a real phone before submitting: a
+  reviewer will lock the screen and check that the pin moves.
 
 ---
 

@@ -14,6 +14,7 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
+import java.io.File
 
 /**
  * Keeps the device's position flowing while the app is not in the foreground.
@@ -55,6 +56,9 @@ class LocationForegroundService : Service() {
     /** Current request interval, so a cadence change can be applied incrementally. */
     private var currentIntervalMs = MOVING_INTERVAL_MS
 
+    /** True once the core has an open vault in this process. */
+    private var headlessReady = false
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -88,6 +92,14 @@ class LocationForegroundService : Service() {
             // location policy requires the user to always see it.
             stopSelf()
             return
+        }
+
+        // Android restarts this service in a fresh process after a low-memory kill,
+        // and in that process the Tauri bootstrap never ran, so the core has no open
+        // vault and would reject every fix. Opening it here is what makes background
+        // sharing survive the app being killed rather than merely backgrounded.
+        if (!headlessReady) {
+            headlessReady = HeadlessVault.boot(File(applicationInfo.dataDir, VAULT_SUBDIR))
         }
 
         if (listener != null) return
@@ -149,6 +161,13 @@ class LocationForegroundService : Service() {
      * `minDistanceM` is the real battery lever: with a distance filter the platform
      * can keep the GPS chip idle until the device has actually moved, instead of
      * waking it on a timer. `minTimeMs` is only a floor.
+     *
+     * The distance filter is deliberately **smaller** than the Rust gate's
+     * `MIN_MOVE_METERS` (15 m). If the two were equal, a device that drifted 14 m
+     * would never be reported, so the core would never see a fix, so the heartbeat
+     * could never fire — and a member walking slowly around a house would vanish
+     * from the map entirely. A smaller filter keeps the core fed while still
+     * letting the platform skip the GPS wake-up for genuinely stationary devices.
      */
     private fun requestUpdates(target: android.location.LocationListener, intervalMs: Long) {
         currentIntervalMs = intervalMs
@@ -375,6 +394,16 @@ class LocationForegroundService : Service() {
     }
 
     companion object {
+        /**
+         * Directory under `applicationInfo.dataDir` that holds the vault.
+         *
+         * Tauri's `appDataDir()` resolves to `Context.getDataDir()` on Android, and
+         * the UI passes that straight to `unlock_vault`, so the vault files sit at
+         * the root of the app's data directory. This must stay in step with
+         * `resolveVaultDir` in `src/App.tsx`.
+         */
+        private const val VAULT_SUBDIR = ""
+
         /** Start background location sharing. */
         const val ACTION_START = "com.shadow720.app.action.START_LOCATION"
 
@@ -397,11 +426,17 @@ class LocationForegroundService : Service() {
         private const val NOTIFICATION_ID = 7201
 
         /**
-         * Distance filter. This is the real battery lever: the platform keeps the
-         * GPS chip idle until the device has actually moved this far, instead of
-         * waking it on a timer.
+         * Distance filter.
+         *
+         * This is the real battery lever: the platform keeps the GPS chip idle until
+         * the device has actually moved this far, instead of waking it on a timer.
+         *
+         * Deliberately smaller than the Rust gate's `MIN_MOVE_METERS` (15 m). If the
+         * two were equal, a device that drifted 14 m would never be reported, so the
+         * core would never see a fix, so the heartbeat could never fire — and a
+         * member walking slowly around a house would vanish from the map entirely.
          */
-        private const val MIN_DISTANCE_M = 15f
+        private const val MIN_DISTANCE_M = 5f
 
         /** Interval while moving at a normal pace. */
         private const val MOVING_INTERVAL_MS = 30_000L

@@ -25,7 +25,15 @@ pub const MIN_MOVE_METERS: f64 = 15.0;
 /// Minimum seconds between location `PATCH`es, regardless of distance.
 pub const MIN_INTERVAL_SECS: u64 = 30;
 /// A stationary member still pings at least this often, so peers can see liveness.
-pub const HEARTBEAT_SECS: u64 = 900;
+/// How long a stationary member may go without publishing before a liveness ping
+/// is sent anyway.
+///
+/// This must stay **below** [`crate::group::MEMBER_STALE_SECS`] (300 s), or a
+/// member who is simply sitting still is rendered as stale/offline on everyone
+/// else's map for the gap between the two thresholds. At 900 s a stationary phone
+/// looked offline for ten minutes out of every fifteen, which is exactly the
+/// "why did their pin go grey?" complaint the heartbeat exists to prevent.
+pub const HEARTBEAT_SECS: u64 = 240;
 /// Fraction of the interval that jitter may add or remove (25%).
 pub const JITTER_FRACTION: f64 = 0.25;
 /// Consecutive `304 Not Modified` polls before an interval is doubled.
@@ -921,9 +929,27 @@ mod tests {
         gate.record_published(fix(41.0000, -87.0000, 1_000_000));
 
         let decision = gate
-            .evaluate(&fix(41.0000, -87.0000, 1_900_000))
+            .evaluate(&fix(
+                41.0000,
+                -87.0000,
+                1_000_000 + (HEARTBEAT_SECS as i64) * 1_000,
+            ))
             .expect("eval");
-        assert_eq!(decision, Publish::Yes, "900 s of stillness is a heartbeat");
+        assert_eq!(decision, Publish::Yes, "a full heartbeat of stillness publishes");
+    }
+
+    #[test]
+    fn heartbeat_fires_before_a_member_is_rendered_stale() {
+        // Regression: the heartbeat used to be 900 s while `MEMBER_STALE_SECS` is
+        // 300 s, so a member who was simply sitting still was drawn as offline for
+        // ten minutes out of every fifteen. The heartbeat has to beat the staleness
+        // threshold, or the map lies about people who are right there.
+        assert!(
+            HEARTBEAT_SECS < crate::group::MEMBER_STALE_SECS as u64,
+            "heartbeat ({HEARTBEAT_SECS} s) must be shorter than the staleness \
+             threshold ({} s), or a stationary member is shown as offline",
+            crate::group::MEMBER_STALE_SECS
+        );
     }
 
     #[test]
@@ -932,7 +958,11 @@ mod tests {
         gate.record_published(fix(41.0000, -87.0000, 1_000_000));
 
         let decision = gate
-            .evaluate(&fix(41.0000, -87.0000, 1_000_000 + 899_000))
+            .evaluate(&fix(
+                41.0000,
+                -87.0000,
+                1_000_000 + ((HEARTBEAT_SECS - 1) as i64) * 1_000,
+            ))
             .expect("eval");
         assert!(matches!(decision, Publish::No(_)));
     }

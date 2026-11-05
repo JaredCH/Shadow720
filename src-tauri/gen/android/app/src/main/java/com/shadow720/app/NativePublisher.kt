@@ -18,6 +18,22 @@ object NativePublisher {
     }
 
     /**
+     * Open the vault in a process that has no Tauri application.
+     *
+     * Android restarts a `START_STICKY` service in a fresh process after a
+     * low-memory kill. In that process the Tauri bootstrap never runs, so there is
+     * no application handle and no open vault, and every [publishFix] would be
+     * rejected. The service calls this once on start to build that state itself.
+     *
+     * Returns `true` when the group is ready to publish.
+     */
+    external fun bootHeadless(
+        vaultDir: String,
+        password: ByteArray,
+        keystoreAlias: String,
+    ): Boolean
+
+    /**
      * Hand a fix to the core.
      *
      * Returns `true` when the core accepted it. `false` means the app is not in a

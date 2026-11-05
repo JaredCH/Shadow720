@@ -718,6 +718,51 @@ impl Keystore for InMemoryKeystore {
     }
 }
 
+/// A [`Keystore`] that only reports an alias.
+///
+/// Used by the Android location service, which opens the vault from a process
+/// where the Tauri plugin owning the Keystore is not registered. The password is
+/// unwrapped by the platform Keystore in Kotlin and passed to
+/// [`SecureVault::open_with_password`], so wrapping and unwrapping are never
+/// reached here. Both return an error rather than silently succeeding, so a
+/// future caller that tries to use this as a real keystore fails loudly.
+pub struct AliasOnlyKeystore {
+    alias: String,
+}
+
+impl AliasOnlyKeystore {
+    /// Report `alias` as the device key that wrapped the vault password.
+    pub fn new(alias: impl Into<String>) -> Self {
+        Self {
+            alias: alias.into(),
+        }
+    }
+}
+
+impl Keystore for AliasOnlyKeystore {
+    fn wrap_secret(&self, _plaintext: &[u8]) -> Result<Vec<u8>> {
+        Err(AppError::vault(
+            "this keystore cannot wrap secrets; it only identifies an existing device key",
+        ))
+    }
+
+    fn unwrap_secret(&self, _wrapped: &[u8]) -> Result<Vec<u8>> {
+        Err(AppError::vault(
+            "this keystore cannot unwrap secrets; the password must be supplied already unwrapped",
+        ))
+    }
+
+    fn key_alias(&self) -> String {
+        self.alias.clone()
+    }
+
+    fn delete_key(&self) -> Result<()> {
+        Err(AppError::vault(
+            "this keystore cannot delete the device key",
+        ))
+    }
+}
+
 /// The two secrets the app cannot function without.
 pub struct VaultContents {
     pub secret: String,
@@ -877,6 +922,45 @@ impl SecureVault {
         Ok(vault)
     }
 
+    /// Open an existing vault whose password has already been unwrapped.
+    ///
+    /// The Android location service runs in a process where the Tauri plugin that
+    /// owns the Keystore is not registered, so it cannot call
+    /// [`Keystore::unwrap_secret`] itself. It unwraps the password through the
+    /// platform Keystore directly and hands the bytes here instead.
+    ///
+    /// `keystore` is still required because the vault records its alias and
+    /// refuses to open under a different device key; it is not asked to unwrap
+    /// anything.
+    pub fn open_with_password(
+        dir: impl Into<PathBuf>,
+        keystore: Arc<dyn Keystore>,
+        password: Vec<u8>,
+    ) -> Result<Self> {
+        let dir = dir.into();
+        if password.len() != VAULT_PASSWORD_LEN {
+            return Err(AppError::vault(format!(
+                "vault password must be {VAULT_PASSWORD_LEN} bytes, got {}",
+                password.len()
+            )));
+        }
+
+        let mut vault = Self {
+            dir,
+            keystore,
+            password: Zeroizing::new(password),
+            contents: Mutex::new(None),
+            descriptor: Mutex::new(None),
+        };
+
+        vault.descriptor = Mutex::new(vault.read_descriptor()?);
+        if vault.vault_path().exists() {
+            let payload = vault.decrypt_payload()?;
+            *vault.contents.lock() = Some(payload);
+        }
+        Ok(vault)
+    }
+
     /// Create if absent, otherwise open.
     pub fn open_or_create(dir: impl Into<PathBuf>, keystore: Arc<dyn Keystore>) -> Result<Self> {
         let dir = dir.into();
@@ -890,6 +974,15 @@ impl SecureVault {
     /// The descriptor, or `None` for a vault that has never stored a group.
     pub fn descriptor(&self) -> Option<VaultDescriptor> {
         self.descriptor.lock().clone()
+    }
+
+    /// The vault password, for tests that exercise the headless open path.
+    ///
+    /// Production code never needs this: the password is unwrapped inside
+    /// [`SecureVault::open`] and never leaves the vault.
+    #[cfg(test)]
+    pub fn password_for_test(&self) -> &[u8] {
+        &self.password
     }
 
     /// Load both secrets, or `None` when the vault is still empty.
@@ -1486,6 +1579,66 @@ mod tests {
             secret: "nostr_secret_TEST".to_string(),
             group_key: Zeroizing::new([7u8; GROUP_KEY_LEN]),
         }
+    }
+
+    #[test]
+    fn open_with_password_reopens_a_vault_without_the_device_key() {
+        // Regression: the Android location service runs in a process where the
+        // Tauri plugin owning the Keystore is not registered, so it cannot unwrap
+        // the vault password itself. It unwraps through the platform Keystore and
+        // hands the bytes to `open_with_password`. If that path did not exist, a
+        // service restarted after a low-memory kill would have no vault and would
+        // silently stop publishing.
+        let dir = scratch("headless-open");
+        let keystore: Arc<dyn Keystore> = Arc::new(InMemoryKeystore::new().expect("keystore"));
+        let vault = SecureVault::create(&dir, keystore.clone()).expect("create");
+        vault
+            .store_group_contents(&contents(), &descriptor_for("nostr/headless"), None)
+            .expect("store");
+
+        // The password the service would have unwrapped in Kotlin.
+        let password = vault.password_for_test().to_vec();
+        // A keystore that can only report the alias, exactly like the service's.
+        let alias_only: Arc<dyn Keystore> = Arc::new(AliasOnlyKeystore::new(IN_MEMORY_ALIAS));
+        let reopened = SecureVault::open_with_password(&dir, alias_only, password)
+            .expect("headless open");
+
+        assert_eq!(
+            reopened.descriptor().map(|d| d.group_ref),
+            Some("nostr/headless".to_string()),
+            "the headless open must see the same group the UI stored"
+        );
+        assert_eq!(
+            reopened.load_contents().expect("contents").map(|c| c.secret),
+            Some("nostr_secret_TEST".to_string()),
+            "the headless open must recover the signing secret"
+        );
+    }
+
+    #[test]
+    fn open_with_password_rejects_a_wrong_length_password() {
+        let dir = scratch("headless-short");
+        let keystore: Arc<dyn Keystore> = Arc::new(InMemoryKeystore::new().expect("keystore"));
+        SecureVault::create(&dir, keystore).expect("create");
+
+        let alias_only: Arc<dyn Keystore> = Arc::new(AliasOnlyKeystore::new(IN_MEMORY_ALIAS));
+        let error = SecureVault::open_with_password(&dir, alias_only, vec![0u8; 4])
+            .expect_err("a short password must be refused");
+        assert!(
+            error.to_string().contains("must be"),
+            "the error should name the length requirement, got: {error}"
+        );
+    }
+
+    #[test]
+    fn alias_only_keystore_refuses_to_wrap_or_unwrap() {
+        // It exists to identify a device key, not to perform crypto. Failing loudly
+        // stops a future caller from mistaking it for a real keystore.
+        let keystore = AliasOnlyKeystore::new("shadow720.vault.wrap");
+        assert_eq!(keystore.key_alias(), "shadow720.vault.wrap");
+        assert!(keystore.wrap_secret(b"secret").is_err());
+        assert!(keystore.unwrap_secret(b"blob").is_err());
+        assert!(keystore.delete_key().is_err());
     }
 
     #[test]
