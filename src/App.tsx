@@ -52,7 +52,7 @@ const MIN_CHAT_DELAY_MS = 1_000;
  * Without it there is no way to tell which APK is installed, which made a
  * report of an already-fixed bug indistinguishable from a new one.
  */
-const APP_VERSION = "0.1.7";
+const APP_VERSION = "0.1.9";
 const MIN_ROSTER_DELAY_MS = 3_000;
 
 /** How often to refresh the local GPS fix while the map tab is visible. */
@@ -88,6 +88,18 @@ export default function App() {
     message: string;
     remedy: LocationRemedy | null;
   } | null>(null);
+  /** Fixes cached while offline, so the UI can say sharing is deferred. */
+  const [pendingLocations, setPendingLocations] = useState(0);
+  /**
+   * Mirror of `pendingLocations` for the poll loop.
+   *
+   * The loop is created once per phase, so reading the state directly would
+   * capture the value from the render that created it and never see an update.
+   */
+  const pendingRef = useRef(0);
+  useEffect(() => {
+    pendingRef.current = pendingLocations;
+  }, [pendingLocations]);
   const [selectedPubkey, setSelectedPubkey] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("map");
   const [banner, setBanner] = useState<AppError | null>(null);
@@ -233,6 +245,30 @@ export default function App() {
 
   // -- polling ---------------------------------------------------------------
 
+  /**
+   * Publish whatever was cached while offline.
+   *
+   * Called when the browser reports the connection is back, after a roster poll
+   * succeeds, and once at startup. All three are needed: the `online` event does
+   * not fire on Android when a relay merely becomes reachable again, a poll is the
+   * only proof that a relay actually answers, and a restart may have left a queue
+   * on disk from a previous session.
+   */
+  const flushPending = useCallback(async () => {
+    try {
+      const flushed = await api.flushPendingLocations();
+      if (flushed > 0) {
+        const snapshot = await api.rosterSnapshot();
+        setRoster(snapshot.members);
+        setTrails(snapshot.trails);
+      }
+      setPendingLocations(0);
+    } catch {
+      // Still offline, or the relay refused. The queue is intact and the next
+      // reconnect will try again, so this is not worth a banner.
+    }
+  }, []);
+
   const stopPolling = useCallback(() => {
     if (chatTimer.current !== null) window.clearTimeout(chatTimer.current);
     if (rosterTimer.current !== null) window.clearTimeout(rosterTimer.current);
@@ -275,6 +311,11 @@ export default function App() {
       setTrails(snapshot.trails);
       if (!response.rateLimited) setBanner(null);
 
+      // A successful poll is the only proof that a relay actually answers, which
+      // is what the `online` event cannot tell us on Android. Anything cached
+      // while offline is published now.
+      if (pendingRef.current > 0) void flushPending();
+
       const delay = Math.max(
         response.nextDelayMs || MIN_ROSTER_DELAY_MS,
         MIN_ROSTER_DELAY_MS,
@@ -289,7 +330,7 @@ export default function App() {
       if (activePhase.current !== "ready") return;
       rosterTimer.current = window.setTimeout(() => void pollRoster(), retry);
     }
-  }, []);
+  }, [flushPending]);
 
   useEffect(() => {
     if (phase !== "ready") {
@@ -331,13 +372,17 @@ export default function App() {
     const battery = await readBattery();
 
     try {
-      await api.updateLocation(result.fix.lat, result.fix.lon, {
+      const response = await api.updateLocation(result.fix.lat, result.fix.lon, {
         speedMps: result.fix.speedMps,
         headingDeg: result.fix.headingDeg,
         accuracyM: result.fix.accuracyM,
         batteryPct: battery?.pct,
         isCharging: battery?.charging,
       });
+      // A queued fix is not an error: the core kept it and will replay it. The
+      // count is what the banner reports, so the user knows sharing is deferred
+      // rather than broken.
+      setPendingLocations(response.pending);
       // Reflect the new position immediately rather than waiting for a poll.
       const snapshot = await api.rosterSnapshot();
       setRoster(snapshot.members);
@@ -438,6 +483,27 @@ export default function App() {
     return () => document.removeEventListener("visibilitychange", onVisible);
   }, [phase, locationNotice, pushFix, showLocationFailure]);
 
+  // -- offline cache ---------------------------------------------------------
+
+  /**
+   * Publish cached fixes when the connection returns.
+   *
+   * The `online` event is the fastest signal on desktop and in the browser, but it
+   * is not sufficient on its own: Android does not fire it when a relay merely
+   * becomes reachable again, and a restart can leave a queue on disk from a
+   * previous session. The roster poll and the startup call cover those cases.
+   */
+  useEffect(() => {
+    if (phase !== "ready") return;
+
+    const onOnline = () => void flushPending();
+    window.addEventListener("online", onOnline);
+    // A queue may have survived the last session, so try once on entry.
+    void flushPending();
+
+    return () => window.removeEventListener("online", onOnline);
+  }, [phase, flushPending]);
+
   // -- native background fixes -----------------------------------------------
 
   /**
@@ -466,7 +532,11 @@ export default function App() {
             batteryPct: fix.batteryPct >= 0 ? fix.batteryPct : undefined,
             isCharging: fix.isCharging,
           })
-          .then(async () => {
+          .then(async (response) => {
+            if (cancelled) return;
+            // The service publishes with the screen off, so this is the only place
+            // the deferred count can be updated while the app is backgrounded.
+            setPendingLocations(response.pending);
             const snapshot = await api.rosterSnapshot();
             if (cancelled) return;
             setRoster(snapshot.members);
@@ -1027,6 +1097,19 @@ export default function App() {
           </div>
         ) : null}
 
+        {pendingLocations > 0 ? (
+          <div className="px-4 pt-3">
+            <InfoBanner
+              message={`No relay is reachable, so ${pendingLocations} position${
+                pendingLocations === 1 ? "" : "s"
+              } ${pendingLocations === 1 ? "is" : "are"} cached on this device. ${
+                pendingLocations === 1 ? "It" : "They"
+              } will be sent automatically when the connection returns.`}
+              tone="warn"
+              action={{ label: "Retry now", onClick: () => void flushPending() }}
+            />
+          </div>
+        ) : null}
         <main className="min-h-0 flex-1 px-4 pt-3 lg:px-6">
           {tab === "map" ? (
             <MapPanel

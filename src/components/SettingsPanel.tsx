@@ -197,6 +197,16 @@ export function SettingsPanel({
                 label="Cadence"
                 value={`messages ${diagnostics.chatIntervalS}s · positions ${diagnostics.rosterIntervalS}s`}
               />
+              <Row
+                label="Offline cache"
+                value={
+                  diagnostics.pendingLocations > 0
+                    ? `${diagnostics.pendingLocations} position${
+                        diagnostics.pendingLocations === 1 ? "" : "s"
+                      } waiting for a relay`
+                    : "empty"
+                }
+              />
               {diagnostics.haltedUntilUnixS ? (
                 <p className="rounded-lg border border-amber-800 bg-amber-950/50 p-2 text-amber-200">
               Sync paused until the relay rate limit resets. Everything resumes

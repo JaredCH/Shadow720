@@ -315,6 +315,8 @@ pub struct GroupState {
     pub trails: RwLock<std::collections::HashMap<String, Vec<TrailPoint>>>,
     /// Month-long track log, kept on this device only.
     pub history: RwLock<crate::history::TrackHistory>,
+    /// Fixes that could not be published yet, replayed when a relay answers.
+    pub outbox: RwLock<crate::outbox::Outbox>,
     /// Smoothed activity per member, so a single noisy fix cannot flip the label.
     pub activity: RwLock<HashMap<String, crate::geo_filter::ActivityTracker>>,
 }
@@ -451,6 +453,7 @@ impl GroupState {
             my_battery: RwLock::new((0, false)),
             trails: RwLock::new(std::collections::HashMap::new()),
             history: RwLock::new(crate::history::TrackHistory::new()),
+            outbox: RwLock::new(crate::outbox::Outbox::new()),
             activity: RwLock::new(HashMap::new()),
         })
     }
@@ -649,6 +652,98 @@ impl GroupState {
         let mut gate = self.gate.write();
         // Rewind by clearing history: the next valid fix will be published.
         gate.reset();
+    }
+
+    // -- Offline outbox -------------------------------------------------------
+
+    /// Defer a fix that could not be published, and record it locally.
+    ///
+    /// The fix is added to the sealed outbox so it can be replayed once a relay
+    /// answers, and to the local track log so the map's history view shows the
+    /// offline stretch rather than a straight line across it. Returns the number
+    /// of fixes now waiting.
+    pub fn queue_location(&self, fix: Fix) -> usize {
+        let (battery_pct, is_charging) = self.battery();
+        let now_ms = crate::wire::now_unix_ms();
+
+        self.record_own_history(fix, battery_pct, is_charging, now_ms);
+
+        let mut outbox = self.outbox.write();
+        outbox.push(
+            crate::outbox::PendingFix {
+                lat: fix.lat,
+                lon: fix.lon,
+                unix_ms: fix.unix_ms,
+                speed_mps: fix.speed_mps,
+                heading_deg: fix.heading_deg,
+                accuracy_m: fix.accuracy_m,
+                battery_pct,
+                is_charging,
+            },
+            now_ms,
+        )
+    }
+
+    /// Append this device's own fix to the local track log.
+    ///
+    /// The roster pass does this for every member it decodes, but a fix that was
+    /// never published is never decoded, so without this the offline stretch would
+    /// be missing from the history exactly when it is most interesting.
+    fn record_own_history(&self, fix: Fix, battery_pct: u8, is_charging: bool, now_ms: i64) {
+        let activity = self.activity_of(&self.identity.pubkey_b64, fix.speed_mps);
+        self.history.write().record(
+            &self.identity.pubkey_b64,
+            crate::history::TrackPoint {
+                lat: fix.lat,
+                lon: fix.lon,
+                unix_ms: fix.unix_ms,
+                speed_mps: fix.speed_mps,
+                activity,
+                battery_pct,
+                is_charging,
+            },
+            now_ms,
+        );
+    }
+
+    /// How many fixes are waiting for a connection.
+    pub fn pending_location_count(&self) -> usize {
+        self.outbox.read().len()
+    }
+
+    /// The newest queued fix, which is the one worth publishing.
+    pub fn newest_pending_location(&self) -> Option<crate::outbox::PendingFix> {
+        self.outbox.read().newest()
+    }
+
+    /// Remove every queued fix, oldest first, so the caller can publish them.
+    pub fn take_pending_locations(&self) -> Vec<crate::outbox::PendingFix> {
+        self.outbox.write().take()
+    }
+
+    /// Put fixes back after a flush failed.
+    pub fn restore_pending_locations(&self, fixes: Vec<crate::outbox::PendingFix>) {
+        self.outbox.write().restore(fixes);
+    }
+
+    /// Replace the in-memory outbox, e.g. after loading it from disk.
+    pub fn install_outbox(&self, outbox: crate::outbox::Outbox) {
+        *self.outbox.write() = outbox;
+    }
+
+    /// Persist the outbox when it has unsaved changes.
+    ///
+    /// Returns `true` when a write happened. A failure is returned rather than
+    /// swallowed: losing the queue means losing the offline stretch, which the
+    /// caller may want to report.
+    pub fn save_outbox(&self, dir: &std::path::Path) -> Result<bool> {
+        let key = self.current_group_key()?;
+        let mut outbox = self.outbox.write();
+        if !outbox.is_dirty() {
+            return Ok(false);
+        }
+        outbox.save(dir, &key)?;
+        Ok(true)
     }
 
     /// Record this device's battery state.
@@ -1852,6 +1947,46 @@ mod tests {
             .consider_location(Fix::at(41.0, -87.0, 1_700_000_001_000,))
             .expect("consider");
         assert_eq!(decision, Publish::Yes);
+    }
+
+    #[test]
+    fn a_queued_fix_is_kept_and_recorded_in_the_local_history() {
+        let state = state();
+        let own = state.identity.pubkey_b64.clone();
+        let now = crate::wire::now_unix_ms();
+
+        assert_eq!(state.pending_location_count(), 0);
+        assert_eq!(state.queue_location(Fix::at(41.0, -87.0, now)), 1);
+        assert_eq!(state.pending_location_count(), 1);
+
+        let newest = state.newest_pending_location().expect("queued");
+        assert_eq!(newest.lat, 41.0);
+        assert_eq!(newest.unix_ms, now);
+
+        // The offline stretch must appear in the history view, not as a gap.
+        let points = state.history_since(&own, 0);
+        assert_eq!(points.len(), 1, "the queued fix is recorded locally");
+        assert_eq!(points[0].lat, 41.0);
+    }
+
+    #[test]
+    fn taking_and_restoring_pending_fixes_round_trips() {
+        let state = state();
+        let now = crate::wire::now_unix_ms();
+        state.queue_location(Fix::at(41.0, -87.0, now - 1_000));
+        state.queue_location(Fix::at(41.1, -87.0, now));
+
+        let taken = state.take_pending_locations();
+        assert_eq!(taken.len(), 2);
+        assert_eq!(state.pending_location_count(), 0);
+
+        state.restore_pending_locations(taken);
+        assert_eq!(state.pending_location_count(), 2);
+        assert_eq!(
+            state.newest_pending_location().map(|fix| fix.lat),
+            Some(41.1),
+            "the newest fix is the one worth publishing"
+        );
     }
 
     #[test]

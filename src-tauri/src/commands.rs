@@ -191,6 +191,13 @@ pub struct LocationUpdateResponse {
     pub should_publish: bool,
     /// Human-readable reason when it is not.
     pub skip_reason: Option<String>,
+    /// True when the fix was deferred because no relay could be reached.
+    ///
+    /// The fix is not lost: it is sealed into the offline outbox and replayed by
+    /// [`flush_pending_locations`] once a relay answers.
+    pub queued: bool,
+    /// Fixes still waiting for a connection, after this call.
+    pub pending: usize,
 }
 
 /// Result of a poll.
@@ -674,6 +681,8 @@ pub struct DiagnosticsResponse {
     pub remaining_requests: Option<u32>,
     pub total_requests: Option<u32>,
     pub fingerprint: String,
+    /// Fixes cached while offline and not yet published.
+    pub pending_locations: usize,
 }
 
 /// Outcome of a rotation notice check.
@@ -744,6 +753,14 @@ pub async fn unlock_vault(
             Ok(history) => group_state.install_history(history),
             Err(error) => {
                 eprintln!("warning: location history could not be loaded ({error}); starting empty");
+            }
+        }
+        // Fixes captured while offline are replayed on the first successful
+        // publish, so they have to survive a restart too.
+        match crate::outbox::Outbox::load(&request.vault_dir, &contents.group_key) {
+            Ok(outbox) => group_state.install_outbox(outbox),
+            Err(error) => {
+                eprintln!("warning: the offline location cache could not be loaded ({error}); starting empty");
             }
         }
         *state.group.write() = Some(Arc::new(group_state));
@@ -850,6 +867,14 @@ pub fn switch_group(state: State<'_, AppState>, group_id: String) -> Result<()> 
     group_state.install_roles(
         &stored.roles.iter().map(|role| (role.pubkey_b64.clone(), role.role.clone())).collect::<Vec<_>>(),
     );
+    // Each group keeps its own outbox: a fix captured for one group must never be
+    // published into another, so the queue is reloaded alongside the keys.
+    match crate::outbox::Outbox::load(vault.dir(), &contents.group_key) {
+        Ok(outbox) => group_state.install_outbox(outbox),
+        Err(error) => {
+            eprintln!("warning: the offline location cache could not be loaded ({error}); starting empty");
+        }
+    }
     *state.group.write() = Some(Arc::new(group_state));
     Ok(())
 }
@@ -1220,6 +1245,8 @@ pub(crate) async fn publish_fix(
         return Ok(LocationUpdateResponse {
             should_publish: false,
             skip_reason: Some(group::describe_skip(reason)),
+            queued: false,
+            pending: group_state.pending_location_count(),
         });
     }
 
@@ -1243,11 +1270,106 @@ pub(crate) async fn publish_fix(
             Ok(LocationUpdateResponse {
                 should_publish: true,
                 skip_reason: None,
+                queued: false,
+                pending: group_state.pending_location_count(),
             })
         }
         Err(error) => {
             // Do not let a failed request suppress the next attempt.
             group_state.record_location_publish_failed();
+
+            // A transport failure is the offline case, not a bug: keep the fix so
+            // it can be replayed instead of leaving peers with a stale pin. Any
+            // other failure (a rejected signature, a bad argument) would fail the
+            // same way on replay, so it is reported rather than queued.
+            if error.kind() == crate::error::AppErrorKind::Network {
+                let pending = group_state.queue_location(fix);
+                persist_outbox(state, &group_state);
+                return Ok(LocationUpdateResponse {
+                    should_publish: true,
+                    skip_reason: Some(
+                        "no relay could be reached, so this position is cached and will be sent when the connection returns"
+                            .to_string(),
+                    ),
+                    queued: true,
+                    pending,
+                });
+            }
+
+            Err(error)
+        }
+    }
+}
+
+/// Write the outbox to disk, best-effort.
+///
+/// A failure here costs the offline stretch if the process is killed before the
+/// next attempt, which is not worth failing the location update over: the fix is
+/// already in memory and the next publish will try again.
+fn persist_outbox(state: &AppState, group_state: &GroupState) {
+    let Ok(vault) = state.vault() else { return };
+    if let Err(error) = group_state.save_outbox(vault.dir()) {
+        eprintln!("warning: the offline location cache could not be saved: {error}");
+    }
+}
+
+/// Publish the newest cached fix after a connection returns.
+///
+/// Only the newest fix is published: a roster slot is an addressable event, so
+/// republishing replaces it and replaying the whole backlog would cost one relay
+/// round-trip per point while leaving peers with the same single position. The
+/// intermediate points are already in the local track log, which is where they
+/// are actually useful.
+///
+/// Returns the number of fixes that were waiting, so the UI can say how much was
+/// caught up. A failure leaves the queue intact for the next attempt.
+#[tauri::command]
+pub async fn flush_pending_locations(state: State<'_, AppState>) -> Result<usize> {
+    let group_state = state.group()?;
+    if group_state.pending_location_count() == 0 {
+        return Ok(0);
+    }
+
+    // Everything that can fail without touching the queue is done first, so a
+    // missing store or an unsealable envelope cannot lose the cached fixes.
+    let store = state.nostr_store()?;
+    let Some(newest) = group_state.newest_pending_location() else {
+        return Ok(0);
+    };
+
+    let fix = Fix {
+        lat: newest.lat,
+        lon: newest.lon,
+        unix_ms: newest.unix_ms,
+        speed_mps: newest.speed_mps,
+        heading_deg: newest.heading_deg,
+        accuracy_m: newest.accuracy_m,
+    };
+
+    // The gate is bypassed deliberately: this fix was already judged worth
+    // publishing when it was captured, and the cooldown it would otherwise hit is
+    // measured against a publish that never happened.
+    group_state.set_battery(newest.battery_pct, newest.is_charging);
+    let envelope = group_state.build_location_envelope(fix)?;
+    let body = serde_json::to_string(&envelope)
+        .map_err(|e| AppError::crypto(format!("could not serialize the envelope: {e}")))?;
+
+    let pending = group_state.take_pending_locations();
+    let count = pending.len();
+
+    match store.publish_roster(&body).await {
+        Ok(_) => {
+            let id = crate::wire::nostr_numeric_id(group_state.identity.pubkey_b64.as_str());
+            *group_state.my_comment_id.write() = Some(id);
+            // The gate must learn about this publish, or the next live fix would
+            // be suppressed by a cooldown measured from the wrong instant.
+            group_state.gate.write().record_published(fix);
+            persist_outbox(&state, &group_state);
+            Ok(count)
+        }
+        Err(error) => {
+            group_state.restore_pending_locations(pending);
+            persist_outbox(&state, &group_state);
             Err(error)
         }
     }
@@ -1484,6 +1606,7 @@ pub fn diagnostics(state: State<'_, AppState>) -> Result<DiagnosticsResponse> {
         remaining_requests: report.remaining_requests,
         total_requests: report.total_requests,
         fingerprint: group_state.identity.fingerprint(),
+        pending_locations: group_state.pending_location_count(),
     })
 }
 
@@ -2454,11 +2577,13 @@ mod tests {
             remaining_requests: Some(4_999),
             total_requests: Some(5_000),
             fingerprint: "ABCD1234".into(),
+            pending_locations: 0,
         };
         let json = serde_json::to_value(&response).expect("serialize");
         assert!(json.get("groupRef").is_some());
         assert!(json.get("knownEpochs").is_some());
         assert!(json.get("chatIntervalS").is_some());
+        assert!(json.get("pendingLocations").is_some());
         assert_eq!(json.get("backend").and_then(|v| v.as_str()), Some("nostr"));
         assert_eq!(json.get("accountless").and_then(|v| v.as_bool()), Some(true));
     }

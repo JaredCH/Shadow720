@@ -18,6 +18,8 @@
 //! | [`wire`] | Backend-neutral wire types shared with the command layer |
 //! | [`vault`] | Keystore-backed secret storage at rest |
 //! | [`group`] | In-memory aggregate: group keys, roster, cadence budget |
+//! | [`history`] | Month-long local track log |
+//! | [`outbox`] | Fixes deferred while offline, replayed on reconnect |
 //! | [`commands`] | `#[tauri::command]` surface for the TypeScript UI |
 //! # Panic freedom
 //!
@@ -47,6 +49,7 @@ pub mod history;
 pub mod nostr;
 pub mod nostr_relay;
 pub mod nostr_store;
+pub mod outbox;
 pub mod storage;
 pub mod vault;
 pub mod wire;
@@ -187,6 +190,7 @@ pub fn run() {
             commands::create_nostr_group,
             commands::join_group,
             commands::update_location,
+            commands::flush_pending_locations,
             commands::poll_roster,
             commands::poll_chat,
             commands::refresh_rate_limit,

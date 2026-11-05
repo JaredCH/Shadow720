@@ -114,6 +114,10 @@ export interface JoinGroupResponse {
 export interface LocationUpdateResponse {
   shouldPublish: boolean;
   skipReason: string | null;
+  /** True when the fix was cached because no relay could be reached. */
+  queued: boolean;
+  /** Fixes still waiting for a connection, after this call. */
+  pending: number;
 }
 
 export interface PollResponse {
@@ -295,6 +299,8 @@ export interface DiagnosticsResponse {
   remainingRequests: number | null;
   totalRequests: number | null;
   fingerprint: string;
+  /** Fixes cached while offline and not yet published. */
+  pendingLocations: number;
 }
 
 export interface VaultAssetView {
@@ -526,6 +532,15 @@ export const updateLocation = (
   });
 
 // -- Polling ----------------------------------------------------------------
+
+/**
+ * Publish the newest fix cached while offline.
+ *
+ * Returns how many fixes were waiting, so the UI can say how much was caught up.
+ * A failure leaves the queue intact and is retried on the next reconnect.
+ */
+export const flushPendingLocations = () =>
+  call<number>("flush_pending_locations");
 
 export const pollRoster = () => call<PollResponse>("poll_roster");
 export const pollChat = () => call<PollResponse>("poll_chat");
