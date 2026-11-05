@@ -17,7 +17,7 @@ const TERMS = [
   "Do not share material you do not have the right to distribute; you are responsible for what you send.",
   "Location sharing is voluntary and can be stopped at any time by leaving the group.",
   "Every message, position, and file is encrypted on your device before it is stored. Nobody operating the storage can read it — including the app's authors.",
-  "You are responsible for who you invite: the join password and invite string are the only things protecting your group's data.",
+  "You are responsible for who you invite: the group code is the only thing protecting your group's data.",
 ];
 
 /**
@@ -220,7 +220,7 @@ export function InviteDisplay({
             onFocus={(event) => event.currentTarget.select()}
           />
           <div className="flex gap-2">
-            <CopyButton text={invite} label="Copy invite" />
+            <CopyButton text={invite} label="Copy group code" />
           </div>
           {containsToken ? (
             <p className="text-xs text-amber-300">
@@ -229,7 +229,7 @@ export function InviteDisplay({
             </p>
           ) : (
             <p className="text-xs text-amber-300">
-              Anyone with this code and the join password can join the group. Share it
+              This code is the secret. Anyone holding it can join the group. Share it
               only with people you trust.
             </p>
           )}
@@ -240,7 +240,7 @@ export function InviteDisplay({
           className="btn-secondary w-full"
           onClick={() => setRevealed(true)}
         >
-          Reveal invite string
+          Reveal group code
         </button>
       )}
 

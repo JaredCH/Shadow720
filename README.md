@@ -8,7 +8,7 @@
 
 **Free forever. $0 to run. No subscription, no per-seat pricing, no hosting bill.**
 
-[![Rust](https://img.shields.io/badge/Rust-415%20tests%20passing-000?logo=rust&logoColor=white)](./src-tauri)
+[![Rust](https://img.shields.io/badge/Rust-367%20tests%20passing-000?logo=rust&logoColor=white)](./src-tauri)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-24C8DB?logo=tauri&logoColor=white)](https://v2.tauri.app)
 [![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](./src)
 [![Platforms](https://img.shields.io/badge/Windows%20%7C%20Android%20%7C%20Linux-ready-5b8cff)](#download)
@@ -68,8 +68,10 @@ There is nothing to host, so there is nothing to pay for. The storage is free-ti
 - **The cache is bounded and encrypted.** At most 512 fixes, nothing older than 24 hours, sealed with the group key beside the vault, and dropped when the vault is wiped. A device left offline for a week cannot grow it without bound.
 - **The displayed build version is correct again.** `APP_VERSION` had been left at `0.1.7` through the 0.1.8 release, so a bug report quoted the wrong build. The bump script now updates and verifies it like every other declaration.
 - **Every release now ships a signed APK.** The build script produced either the Play bundle or the sideloadable APK, never both, so a release could go out with nothing a user outside Play could install. Both are now built and attached on every run, signed with the same key and carrying the same `versionCode`.
+- **Joining is a single paste.** Invites are now self-contained `GRP2-` codes: the wrapping key rides inside the token, so there is no join password to remember or transmit. Legacy `GRP1-` codes still work and are sealed with a password via `Argon2id`.
+- **A demo video for the Play location declaration.** The full consent flow — terms gate, location disclosure, OS permission dialog, background-location settings trip, lock-screen proof, and leave-and-wipe — is recorded and verified against the shot list in `docs/play/`.
 
-### What's new in 0.1.9
+### What's new in 0.1.9 (earlier)
 
 - **Tap a name to fly there.** Selecting a member in the roster centres and zooms the map on them, and turns off "Following you" so the view stays put.
 - **A month of history.** Every device keeps a 31-day track log, grouped by day and week, with distance, dominant activity, and lowest battery per day. It is sealed with the group key and never published.
@@ -139,29 +141,29 @@ The vault password is wrapped by a 32-byte device key. On Linux that key lives i
 ## Getting a group running in 60 seconds
 
 <div align="center">
-<img src="docs/screens/setup.png" width="300" alt="Group setup screen with invite string, join password, and display name fields" />
+<img src="docs/screens/setup.png" width="300" alt="Group setup screen with group code and display name fields" />
 </div>
 
 **Create a group**
 
 1. Open the app and accept the terms and location disclosure.
 2. Choose **Create a group**. Nostr is selected by default — it is the only working backend.
-3. Enter a group name, a join password, and your display name.
+3. Enter a group name and your display name.
 
-That's it. A keypair is generated on the device, the group key is sealed inside the invite, and you get a `GRP1-…` string to share.
+That's it. A keypair is generated on the device, the group key is sealed inside the invite, and you get a `GRP2-…` string to share.
 
 **Join a group**
 
-Paste the invite string, enter the join password you were given separately, and pick a display name. No account, no email, no verification.
+Paste the group code your friend sent you and pick a display name. No account, no email, no verification, no password.
 
-> Hand the invite and the password over two different channels you trust. Together they are the only thing protecting the group.
+> The group code is the secret. Anyone holding it can join the group. Share it only with people you trust, over a channel you trust.
 
 ---
 
 ## What works
 
 | Area | State |
-| Rust core | **341 unit tests**, all passing |
+| Rust core | **367 unit tests**, all passing |
 | TypeScript UI | `tsc --noEmit` clean, production bundle builds |
 | Map | OpenStreetMap basemap, follows the OS light/dark theme, fading travel trails with heading arrows |
 | Map focus | Tapping a name in the roster centres and zooms the map on that member |
@@ -290,7 +292,7 @@ Battery level and charging state ride along with each published fix. Android is 
 | **Confidentiality** | `XChaCha20-Poly1305` for all payloads, invites, and file blobs |
 | **Integrity** | AEAD tag over every payload; SHA-256 over every file blob |
 | **Authenticity** | `Ed25519` over a length-prefixed canonical form including protocol version, key epoch, sender key, nonce, and ciphertext |
-| **Key agreement** | join password → invite wrapping key via `Argon2id` (`m=19456, t=2, p=1`); the group key rides inside the encrypted invite |
+| **Key agreement** | the group key rides inside the self-contained `GRP2-` invite; legacy `GRP1-` invites are sealed with a join password via `Argon2id` (`m=19456, t=2, p=1`) |
 | **At rest** | sealed vault file whose key is wrapped by the OS keystore — Android Keystore, Windows DPAPI — so a copy of the app's files is useless on another device |
 | **Rotation** | key epochs: a removed member loses access to everything written after the rotation, while older content stays readable |
 | **Transport** | `rustls` only, no OpenSSL; WebSocket for relays, HTTPS for blobs |
@@ -302,7 +304,7 @@ Battery level and charging state ride along with each published fix. Android is 
 |---|---|
 | That *some* pubkey published *an* event at *some* time | Positions, messages, file contents, display names |
 | Event sizes and counts | Group membership (roster entries are encrypted) |
-| Which relays you connect to | Your join password or group key |
+| Which relays you connect to | Your group code or group key |
 | The map viewport you are looking at (tile requests) | Anything about who else is in the group |
 
 ### Threat model, stated plainly
@@ -396,7 +398,7 @@ Verified working set:
 ### Tests and lint
 
 ```powershell
-npm run test:rust     # 415 tests
+npm run test:rust     # 367 tests
 npm run lint:rust     # clippy, warnings denied
 npm run typecheck
 ```
@@ -525,12 +527,12 @@ cargo run --example nostr_selftest
 | Terms of use (public) | <https://jaredch.github.io/shadow720-legal/TERMS.md> |
 | Field-by-field Console answers | [docs/play/PLAY_CONSOLE_ANSWERS.md](./docs/play/PLAY_CONSOLE_ANSWERS.md) |
 | Data safety worksheet | [docs/play/DATA_SAFETY_WORKSHEET.md](./docs/play/DATA_SAFETY_WORKSHEET.md) |
-| Background-location demo video plan | [docs/play/DEMO_VIDEO_SCRIPT.md](./docs/play/DEMO_VIDEO_SCRIPT.md) |
+| Background-location demo video | [docs/play/DEMO_VIDEO_SCRIPT.md](./docs/play/DEMO_VIDEO_SCRIPT.md) — shot list and narration; the recording is captured and verified against it |
 
 **No reviewer credentials are needed.** The app has no account system and no
-per-install provisioning, so a reviewer installs it, creates a group with a name and
-a password, and is immediately in a working group. There is nothing for us to hand
-over and nothing for them to be granted access to.
+per-install provisioning, so a reviewer installs it, creates a group with a name,
+and is immediately in a working group. There is nothing for us to hand over and
+nothing for them to be granted access to.
 
 The release artifact is a signed `.aab` built by [scripts/build-release.ps1](./scripts/build-release.ps1),
 which also syncs `versionCode` from `tauri.conf.json` so the bundle cannot ship a
@@ -557,10 +559,12 @@ Honest list. The app says these out loud rather than pretending otherwise.
 - **Activity is inferred from reported speed**, not from a motion sensor. A device that reports no speed shows as stationary even while moving.
 - **Trails are local and short.** Each member's recent positions are kept in memory on this device only, capped at 60 points, and are not published or shared.
 - **The offline cache publishes only the newest fix.** Positions captured while offline are all kept locally and appear in the history view, but a reconnect sends just the latest one, because a roster slot is a single replaceable event. Peers see where you are, not the route you took to get there.
-- **Background location is unverified on hardware.** The foreground service, the JNI
-  publish path, and the Keystore round trip are compiled and configured but have not
-  been exercised on a physical device. Test on a real phone before submitting: a
-  reviewer will lock the screen and check that the pin moves.
+- **Background location is verified on an emulator, not yet on physical hardware.**
+  The full flow — foreground service, JNI publish path, Keystore round trip, and
+  position updates with the screen locked — is exercised in the recorded demo
+  (`demo/Shadow720_demo.mp4`), but that ran on an emulator. Test on a real phone
+  before relying on it: OEM battery savers can kill foreground services that an
+  emulator never applies.
 
 ---
 

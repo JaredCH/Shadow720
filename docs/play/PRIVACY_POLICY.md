@@ -109,8 +109,8 @@ information from children.
 - The group key is shared by all members. Removing someone requires rotating the key;
   after a rotation, a removed member can still read content written *before* the
   rotation, because they already hold that older key.
-- Anyone holding an invite string and the join password can join the group and read
-  everything the group key protects.
+- Anyone holding a group code can join the group and read everything the group key
+  protects. The code is the secret: share it only with people you trust.
 - If your device is reset or its hardware key is invalidated, the local vault becomes
   unreadable and you will need a fresh invite. This is intentional: it is what
   prevents a copy of the app's files from yielding your keys.

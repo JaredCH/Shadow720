@@ -2,7 +2,7 @@ import { useState } from "react";
 import type { MemberView, RotateResponse } from "../lib/api";
 import { describeError, toAppError } from "../lib/api";
 import { shortKey } from "../lib/format";
-import { CopyButton, Field, Modal } from "./Modal";
+import { CopyButton, Modal } from "./Modal";
 
 interface PeopleSheetProps {
   roster: MemberView[];
@@ -11,7 +11,7 @@ interface PeopleSheetProps {
   accountless: boolean;
   onClose: () => void;
   onSetRole: (pubkey: string, role: "admin" | "member") => Promise<void>;
-  onKick: (pubkey: string, joinPassword: string) => Promise<RotateResponse>;
+  onKick: (pubkey: string) => Promise<RotateResponse>;
 }
 
 /**
@@ -31,7 +31,6 @@ export function PeopleSheet({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [kick, setKick] = useState<MemberView | null>(null);
-  const [password, setPassword] = useState("");
   const [result, setResult] = useState<RotateResponse | null>(null);
 
   const run = async (action: () => Promise<void>) => {
@@ -50,8 +49,8 @@ export function PeopleSheet({
     return (
       <Modal title="Member removed" primaryLabel="Done" onPrimary={onClose}>
         <p>
-          The group key was rotated. Share this new group code, plus the join
-          password, with everyone who should stay.
+          The group key was rotated. Share this new group code with everyone who
+          should stay.
         </p>
         {accountless ? (
           <p className="text-xs text-slate-400">
@@ -88,18 +87,13 @@ export function PeopleSheet({
         title={`Remove ${kick.displayName || "this member"}?`}
         primaryLabel="Kick and rotate key"
         onPrimary={() => {
-          if (password.length === 0) {
-            setError("Enter the join password to rotate the key.");
-            return;
-          }
           void run(async () => {
-            setResult(await onKick(kick.pubkeyB64, password));
+            setResult(await onKick(kick.pubkeyB64));
           });
         }}
         secondaryLabel="Back"
         onSecondary={() => {
           setKick(null);
-          setPassword("");
           setError(null);
         }}
         busy={busy}
@@ -108,13 +102,6 @@ export function PeopleSheet({
           This rotates the group key. They lose access to new messages. Everyone
           who stays needs the new group code.
         </p>
-        <Field
-          label="Join password"
-          type="password"
-          value={password}
-          onChange={setPassword}
-          autoComplete="current-password"
-        />
         {error ? <p className="text-xs text-red-300">{error}</p> : null}
       </Modal>
     );

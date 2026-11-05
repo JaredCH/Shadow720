@@ -9,7 +9,7 @@
 //! Primitives
 //! ----------
 //! * `Ed25519` — sender authenticity. Deterministic, 32-byte public keys.
-//! * `Argon2id` — derives the invite wrapping key from the join password.
+//! * `Argon2id` — derives the legacy `GRP1-` invite wrapping key from the join password.
 //! * `XChaCha20-Poly1305` — confidentiality + integrity for payloads and invites.
 //!
 //! Wire formats
@@ -38,6 +38,9 @@ use crate::error::{AppError, Result};
 
 /// Prefix on every invite string.
 pub const INVITE_PREFIX: &str = "GRP1-";
+/// Prefix for self-contained invites: the wrapping key rides inside the token,
+/// so the whole string is the secret and no join password exists.
+pub const INVITE_PREFIX_V2: &str = "GRP2-";
 /// Protocol version for both invites and envelopes.
 pub const PROTOCOL_VERSION: u8 = 1;
 
@@ -239,6 +242,149 @@ pub struct InviteParts {
     pub salt: [u8; SALT_LEN],
     pub nonce: [u8; NONCE_LEN],
     pub ciphertext: Vec<u8>,
+}
+
+/// Raw components of a `GRP2-` token.
+///
+/// The wrapping key is carried in the clear inside the token: the token itself is
+/// the secret, so there is no join password to remember or transmit separately.
+#[derive(Clone, Debug)]
+pub struct InvitePartsV2 {
+    pub version: u8,
+    pub nonce: [u8; NONCE_LEN],
+    pub wrapping_key: [u8; GROUP_KEY_LEN],
+    pub ciphertext: Vec<u8>,
+}
+
+/// Pack credentials into a `GRP2-` invite string.
+///
+/// The token is self-contained: anyone holding the string can unwrap the group
+/// key. That is the intended model — treat the string like a WhatsApp group link.
+pub fn pack_invite_v2(payload: &InviteCredentialsPayload) -> Result<String> {
+    let nonce = random_bytes::<NONCE_LEN>()?;
+    let wrapping_key = random_bytes::<GROUP_KEY_LEN>()?;
+    pack_invite_v2_with_nonce(payload, nonce, wrapping_key)
+}
+
+/// Deterministic variant of [`pack_invite_v2`] for reproducible test vectors.
+pub fn pack_invite_v2_with_nonce(
+    payload: &InviteCredentialsPayload,
+    nonce: [u8; NONCE_LEN],
+    wrapping_key: [u8; GROUP_KEY_LEN],
+) -> Result<String> {
+    payload.validate()?;
+
+    let json = serde_json::to_vec(payload)
+        .map_err(|e| AppError::crypto(format!("could not serialize invite payload: {e}")))?;
+    let compressed = zstd::bulk::compress(&json, 9)
+        .map_err(|e| AppError::crypto(format!("could not compress invite payload: {e}")))?;
+
+    let cipher = cipher_from_key(&wrapping_key)?;
+    let ciphertext = cipher
+        .encrypt(
+            &XNonce::from(nonce),
+            Payload {
+                msg: &compressed,
+                aad: &[payload.version],
+            },
+        )
+        .map_err(|_| AppError::crypto("invite encryption failed"))?;
+
+    let mut blob = Vec::with_capacity(1 + NONCE_LEN + GROUP_KEY_LEN + ciphertext.len());
+    blob.push(payload.version);
+    blob.extend_from_slice(&nonce);
+    blob.extend_from_slice(&wrapping_key);
+    blob.extend_from_slice(&ciphertext);
+
+    Ok(format!("{INVITE_PREFIX_V2}{}", B64_URL.encode(&blob)))
+}
+
+/// Parse the outer structure of a `GRP2-` token.
+pub fn parse_invite_parts_v2(token: &str) -> Result<InvitePartsV2> {
+    let trimmed = token.trim();
+    let body = match trimmed.strip_prefix(INVITE_PREFIX_V2) {
+        Some(rest) => rest,
+        None => {
+            return Err(AppError::InviteFormat(format!(
+                "invite string must start with {INVITE_PREFIX_V2}"
+            )))
+        }
+    };
+    if body.is_empty() {
+        return Err(AppError::InviteFormat("invite string is empty".into()));
+    }
+
+    let raw = B64_URL
+        .decode(body.as_bytes())
+        .map_err(|e| AppError::InviteFormat(format!("invite is not valid base64url: {e}")))?;
+
+    let minimum = 1 + NONCE_LEN + GROUP_KEY_LEN + TAG_LEN;
+    if raw.len() < minimum {
+        return Err(AppError::InviteFormat(format!(
+            "invite is truncated: {} bytes, need at least {minimum}",
+            raw.len()
+        )));
+    }
+
+    let (version_slice, rest) = raw.split_at_checked(1).ok_or_else(|| {
+        AppError::InviteFormat("invite is missing its version byte".into())
+    })?;
+    let (nonce_slice, rest) = rest.split_at_checked(NONCE_LEN).ok_or_else(|| {
+        AppError::InviteFormat("invite is missing its nonce".into())
+    })?;
+    let (key_slice, ciphertext_slice) = rest.split_at_checked(GROUP_KEY_LEN).ok_or_else(|| {
+        AppError::InviteFormat("invite is missing its wrapping key".into())
+    })?;
+
+    let version = *version_slice
+        .first()
+        .ok_or_else(|| AppError::InviteFormat("invite is missing its version byte".into()))?;
+    let nonce: [u8; NONCE_LEN] = nonce_slice
+        .try_into()
+        .map_err(|_| AppError::InviteFormat("invite nonce is the wrong size".into()))?;
+    let wrapping_key: [u8; GROUP_KEY_LEN] = key_slice
+        .try_into()
+        .map_err(|_| AppError::InviteFormat("invite wrapping key is the wrong size".into()))?;
+
+    Ok(InvitePartsV2 {
+        version,
+        nonce,
+        wrapping_key,
+        ciphertext: ciphertext_slice.to_vec(),
+    })
+}
+
+/// Unwrap a `GRP2-` invite string. No password is involved.
+pub fn unpack_invite_v2(token: &str) -> Result<InviteCredentialsPayload> {
+    let parts = parse_invite_parts_v2(token)?;
+    if parts.version != PROTOCOL_VERSION {
+        return Err(AppError::InviteFormat(format!(
+            "unsupported invite version {} (this build speaks {PROTOCOL_VERSION})",
+            parts.version
+        )));
+    }
+
+    let cipher = cipher_from_key(&parts.wrapping_key)?;
+    let mut compressed = cipher
+        .decrypt(
+            &XNonce::from(parts.nonce),
+            Payload {
+                msg: &parts.ciphertext,
+                aad: &[parts.version],
+            },
+        )
+        .map_err(|_| AppError::InviteFormat("this invite code is damaged or was altered".into()))?;
+
+    let mut json = zstd::bulk::decompress(&compressed, DECOMPRESS_LIMIT_BYTES)
+        .map_err(|e| AppError::InviteFormat(format!("invite payload is corrupt: {e}")))?;
+    compressed.zeroize();
+
+    let payload: InviteCredentialsPayload = serde_json::from_slice(&json)
+        .map_err(|e| AppError::InviteFormat(format!("invite payload is malformed: {e}")))?;
+    json.zeroize();
+
+    payload.validate()?;
+    Ok(payload)
 }
 
 /// Pack credentials into a `GRP1-` invite string.
@@ -1292,6 +1438,94 @@ mod tests {
         let b = pack_invite_with_nonce(&payload, "pw", [1u8; SALT_LEN], [2u8; NONCE_LEN])
             .expect("second");
         assert_eq!(a, b, "same salt+nonce must produce the same token");
+    }
+
+    // -- Self-contained invites (GRP2-) ---------------------------------------
+
+    #[test]
+    fn self_contained_invite_round_trips_without_a_password() {
+        let payload = sample_payload();
+        let token = pack_invite_v2(&payload).expect("pack");
+        assert!(token.starts_with(INVITE_PREFIX_V2));
+
+        let recovered = unpack_invite_v2(&token).expect("unpack");
+        assert_eq!(recovered.group_id, "group-abc");
+        assert_eq!(recovered.group_master_key, [7u8; GROUP_KEY_LEN]);
+        assert_eq!(recovered.relays, vec!["wss://relay.damus.io".to_string()]);
+        assert_eq!(recovered.group_label, "Weekend Trip");
+    }
+
+    #[test]
+    fn self_contained_invite_is_base64url_without_padding() {
+        let token = pack_invite_v2(&sample_payload()).expect("pack");
+        let body = token.strip_prefix(INVITE_PREFIX_V2).expect("prefix");
+        assert!(!body.contains('+'), "base64url must not contain '+'");
+        assert!(!body.contains('/'), "base64url must not contain '/'");
+        assert!(!body.contains('='), "invite must be unpadded");
+    }
+
+    #[test]
+    fn self_contained_invite_rejects_missing_prefix() {
+        let err = parse_invite_parts_v2("GRP1-AAAA").expect_err("must fail");
+        assert_eq!(err.kind(), crate::error::AppErrorKind::InviteFormat);
+        assert!(err.to_string().contains("GRP2-"));
+    }
+
+    #[test]
+    fn self_contained_invite_rejects_non_base64_body() {
+        let err = parse_invite_parts_v2("GRP2-not!valid!base64!").expect_err("must fail");
+        assert_eq!(err.kind(), crate::error::AppErrorKind::InviteFormat);
+    }
+
+    #[test]
+    fn self_contained_invite_rejects_truncated_body() {
+        let short = B64_URL.encode([1u8, 2, 3, 4]);
+        let err = parse_invite_parts_v2(&format!("{INVITE_PREFIX_V2}{short}"))
+            .expect_err("must fail");
+        assert_eq!(err.kind(), crate::error::AppErrorKind::InviteFormat);
+        assert!(err.to_string().contains("truncated"));
+    }
+
+    #[test]
+    fn self_contained_invite_ciphertext_is_single_bit_flip_sensitive() {
+        let payload = sample_payload();
+        let nonce = [9u8; NONCE_LEN];
+        let wrapping_key = [4u8; GROUP_KEY_LEN];
+        let token = pack_invite_v2_with_nonce(&payload, nonce, wrapping_key)
+            .expect("deterministic pack");
+
+        let parts = parse_invite_parts_v2(&token).expect("parts");
+        let mut tampered = parts.ciphertext.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0b0000_0001;
+
+        let mut blob = Vec::new();
+        blob.push(parts.version);
+        blob.extend_from_slice(&parts.nonce);
+        blob.extend_from_slice(&parts.wrapping_key);
+        blob.extend_from_slice(&tampered);
+        let bad_token = format!("{INVITE_PREFIX_V2}{}", B64_URL.encode(&blob));
+
+        let err = unpack_invite_v2(&bad_token).expect_err("tamper must be detected");
+        assert_eq!(err.kind(), crate::error::AppErrorKind::InviteFormat);
+    }
+
+    #[test]
+    fn deterministic_self_contained_pack_is_stable() {
+        let payload = sample_payload();
+        let a = pack_invite_v2_with_nonce(&payload, [1u8; NONCE_LEN], [2u8; GROUP_KEY_LEN])
+            .expect("first");
+        let b = pack_invite_v2_with_nonce(&payload, [1u8; NONCE_LEN], [2u8; GROUP_KEY_LEN])
+            .expect("second");
+        assert_eq!(a, b, "same nonce+key must produce the same token");
+    }
+
+    #[test]
+    fn self_contained_invite_rejects_unsupported_version() {
+        let mut payload = sample_payload();
+        payload.version = 9;
+        let err = pack_invite_v2(&payload).expect_err("must fail");
+        assert_eq!(err.kind(), crate::error::AppErrorKind::InviteFormat);
     }
 
     // -- Envelope round trip -------------------------------------------------

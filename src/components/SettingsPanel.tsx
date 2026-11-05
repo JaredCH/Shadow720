@@ -9,7 +9,7 @@ import type {
 import { describeError } from "../lib/api";
 import { formatBytes, relativeAge, shortKey } from "../lib/format";
 import { openExternal, PRIVACY_POLICY_URL, TERMS_URL } from "../lib/legal";
-import { ConfirmSheet, CopyButton, Field, Modal } from "./Modal";
+import { ConfirmSheet, CopyButton, Modal } from "./Modal";
 
 interface SettingsPanelProps {
   diagnostics: DiagnosticsResponse | null;
@@ -26,7 +26,7 @@ interface SettingsPanelProps {
     onBlock: (pubkeyB64: string, blocked: boolean) => Promise<void>;
   onRefreshVault: () => Promise<void>;
   onDeleteNostrBlob: (sha256: string) => Promise<string>;
-  onRotate: (joinPassword: string, removePubkeys: string[]) => Promise<MemberInvite[]>;
+  onRotate: (removePubkeys: string[]) => Promise<MemberInvite[]>;
   onLeave: () => Promise<void>;
   onDestroy: () => Promise<void>;
   onClose: () => void;
@@ -67,7 +67,6 @@ export function SettingsPanel({
   onClose,
 }: SettingsPanelProps) {
   const [sheet, setSheet] = useState<Sheet>({ kind: "none" });
-  const [joinPassword, setJoinPassword] = useState("");
   const [removePubkeys, setRemovePubkeys] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<AppError | null>(null);
@@ -79,8 +78,7 @@ export function SettingsPanel({
     setError(null);
     setBusy(true);
     try {
-      const invites = await onRotate(joinPassword, [...removePubkeys]);
-      setJoinPassword("");
+      const invites = await onRotate([...removePubkeys]);
       setRemovePubkeys(new Set());
       setSheet({
         kind: "invites",
@@ -346,7 +344,7 @@ export function SettingsPanel({
             </h3>
             <p className="text-xs text-slate-500">
               Rotating the key cuts off anyone who is removed. Each remaining member
-              needs their new invite string, so only rotate when you can hand them out.
+              needs their new group code, so only rotate when you can hand them out.
             </p>
             <button
               type="button"
@@ -471,7 +469,7 @@ export function SettingsPanel({
           onPrimary={() => void runRotate()}
           secondaryLabel="Cancel"
           onSecondary={() => setSheet({ kind: "none" })}
-          busy={busy || joinPassword.length === 0}
+          busy={busy}
         >
           <p>
             {removePubkeys.size > 0
@@ -482,14 +480,6 @@ export function SettingsPanel({
             Members who kept an old invite can still read messages sent before the
             rotation. Cannot be undone.
           </p>
-          <Field
-            label="Join password"
-            type="password"
-            value={joinPassword}
-            onChange={setJoinPassword}
-            placeholder="The group's join password"
-            hint="Used to re-wrap each member's new invite."
-          />
         </Modal>
       ) : null}
 

@@ -114,11 +114,14 @@ rather than opportunistically.
 - [x] The privacy policy is linked from inside the app (Settings → About, and both
       consent-gate stages).
 - [ ] Demo video is uploaded and its URL is entered in the location declaration.
-- [ ] The disclosure wording in the shipped build matches
+      *(Recording complete: `demo/Shadow720_demo.mp4`, 3:23, 1080×2400 — upload
+      pending.)*
+- [x] The disclosure wording in the shipped build matches
       [PLAY_CONSOLE_ANSWERS.md](./PLAY_CONSOLE_ANSWERS.md) §2 and the video.
-- [ ] Terms and disclosure gates are reachable on a **fresh install**.
-- [ ] The persistent foreground-service notification is present whenever background
-      location is active.
+- [x] Terms and disclosure gates are reachable on a **fresh install** (verified
+      during the demo recording: `pm clear` → gates appear in order).
+- [x] The persistent foreground-service notification is present whenever background
+      location is active (verified on camera in the demo, shot 12).
 - [x] `CAMERA` is removed from the manifest.
 - [ ] The app collects nothing before the consent gates are cleared (verify by
       watching network traffic on a fresh install with no group joined).

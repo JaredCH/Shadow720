@@ -213,8 +213,8 @@ these are implemented:
 > than your group members — not the relay operators, not us — can read any of it.
 >
 > HOW IT WORKS
-> • One person creates a group and shares a single invite string with the members.
-> • Members do not need any account. Paste the invite and enter the group password.
+> • One person creates a group and shares a single group code with the members.
+> • Members do not need any account. Paste the code and join.
 > • Your position appears on the others' maps, updating as you move.
 > • Chat and file sharing work the same way: encrypted before they leave your phone.
 >

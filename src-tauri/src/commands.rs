@@ -29,6 +29,8 @@ use crate::group::{
 use crate::vault::{SecureVault, StoredGroup, StoredUpload, VaultContents, VaultDescriptor, DESCRIPTOR_VERSION};
 use crate::wire::{now_unix_ms, IssueComment};
 
+use rand_core::RngCore as _;
+
 // ---------------------------------------------------------------------------
 // Application state
 // ---------------------------------------------------------------------------
@@ -144,7 +146,12 @@ pub struct UnlockResponse {
 #[serde(rename_all = "camelCase")]
 pub struct JoinGroupRequest {
     pub invite: String,
+    /// Required only for legacy `GRP1-` invites, which are sealed with it.
+    /// Self-contained `GRP2-` invites ignore this field.
+    #[serde(default)]
     pub join_password: String,
+    /// Optional. Generated locally when empty so joining is a single paste.
+    #[serde(default)]
     pub display_name: String,
 }
 
@@ -608,6 +615,8 @@ pub struct MemberInvite {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RotateRequest {
+    /// Accepted for backwards compatibility with older UI builds; ignored.
+    #[serde(default)]
     pub join_password: String,
     #[serde(default)]
     pub reason: Option<String>,
@@ -617,9 +626,13 @@ pub struct RotateRequest {
 }
 
 /// Request to pack the current group code.
+///
+/// Kept for wire compatibility; the field is ignored because self-contained
+/// invites need no password.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareInviteRequest {
+    #[serde(default)]
     pub join_password: String,
 }
 
@@ -988,6 +1001,8 @@ pub fn set_preferences(
 #[serde(rename_all = "camelCase")]
 pub struct CreateNostrGroupRequest {
     pub group_label: String,
+    /// Accepted for backwards compatibility with older UI builds; ignored.
+    #[serde(default)]
     pub join_password: String,
     pub display_name: String,
     /// Relay URLs. Defaults to the built-in list when empty.
@@ -1022,11 +1037,6 @@ pub async fn create_nostr_group(
     request: CreateNostrGroupRequest,
 ) -> Result<CreateNostrGroupResponse> {
     let vault = state.vault()?;
-    if request.join_password.is_empty() {
-        return Err(AppError::invalid_argument(
-            "a join password is required; it is what protects the invite string",
-        ));
-    }
 
     let relays = if request.relays.is_empty() {
         crate::nostr::DEFAULT_RELAYS
@@ -1069,7 +1079,7 @@ pub async fn create_nostr_group(
         key_epoch: 0,
     };
 
-    let invite = crypto::pack_invite(&invite_payload, &request.join_password)?;
+    let invite = crypto::pack_invite_v2(&invite_payload)?;
 
     let preferences = Preferences {
         display_name: request.display_name.trim().to_string(),
@@ -1125,10 +1135,22 @@ pub async fn join_group(
 ) -> Result<JoinGroupResponse> {
     let vault = state.vault()?;
 
-    let invite = crypto::unpack_invite(&request.invite, &request.join_password)?;
+    let trimmed = request.invite.trim();
+    let invite = if trimmed.starts_with(crypto::INVITE_PREFIX_V2) {
+        crypto::unpack_invite_v2(trimmed)?
+    } else {
+        crypto::unpack_invite(trimmed, &request.join_password)?
+    };
     invite.validate()?;
 
     let identity = Identity::generate()?;
+
+    // A display name is required by the roster, but joining should be a single
+    // paste: generate a friendly local one when the caller left it empty.
+    let display_name = match request.display_name.trim() {
+        "" => generate_display_name()?,
+        name => name.to_string(),
+    };
 
     // Nostr is the only backend: joining generates a fresh keypair and checks
     // whether this device already has a slot, and whether the host closed the
@@ -1158,7 +1180,7 @@ pub async fn join_group(
     let stored_secret = nostr_identity.secret_hex().to_string();
 
     let preferences = Preferences {
-        display_name: request.display_name.trim().to_string(),
+        display_name,
         avatar_color: "#5b8cff".to_string(),
         blocked_pubkeys: Default::default(),
         accepted_eula: true,
@@ -1182,7 +1204,7 @@ pub async fn join_group(
             invite: invite.clone(),
             identity_secret: *identity.secret_bytes(),
             preferences: preferences.clone(),
-            invite_code: Some(request.invite.trim().to_string()),
+            invite_code: Some(trimmed.to_string()),
             roles: Vec::new(),
             is_host: false,
             uploads: Vec::new(),
@@ -1914,16 +1936,14 @@ pub fn current_invite(state: State<'_, AppState>) -> Result<Option<String>> {
 
 /// Pack a fresh invite from the live group key.
 ///
-/// Any member can do this. It does not rotate the key. The join password is
-/// required because it is what seals the string.
+/// Any member can do this. It does not rotate the key. The string is
+/// self-contained: whoever holds it can join, so share it only with people you
+/// trust.
 #[tauri::command]
-pub fn share_invite(state: State<'_, AppState>, request: ShareInviteRequest) -> Result<ShareInviteResponse> {
+pub fn share_invite(state: State<'_, AppState>) -> Result<ShareInviteResponse> {
     let group_state = state.group()?;
     let vault = state.vault()?;
-    if request.join_password.is_empty() {
-        return Err(AppError::invalid_argument("the join password is required to pack the group code"));
-    }
-    let invite = pack_current_invite(&group_state, &request.join_password)?;
+    let invite = pack_current_invite(&group_state)?;
     vault.save_invite_code(&invite)?;
     Ok(ShareInviteResponse {
         invite,
@@ -1954,11 +1974,6 @@ pub async fn rotate_group_key(
     if !group_state.is_host {
         return Err(AppError::group_state(
             "only the host may rotate the group key",
-        ));
-    }
-    if request.join_password.is_empty() {
-        return Err(AppError::invalid_argument(
-            "a join password is required to re-issue invites",
         ));
     }
 
@@ -2001,12 +2016,11 @@ pub async fn rotate_group_key(
 
     let invites = build_member_invites(
         &group_state,
-        &request.join_password,
         new_epoch,
         &new_key,
         &removed_pubkeys,
     )?;
-    let group_invite = pack_current_invite(&group_state, &request.join_password)?;
+    let group_invite = pack_current_invite(&group_state)?;
     let _ = vault.save_invite_code(&group_invite);
 
     Ok(RotateResponse {
@@ -2264,7 +2278,36 @@ fn stored_roles(group_state: &GroupState) -> Vec<crate::vault::StoredRole> {
         .collect()
 }
 
-fn pack_current_invite(group_state: &GroupState, join_password: &str) -> Result<String> {
+/// A friendly placeholder name for a member who joined with one paste.
+///
+/// Local only: the member can change it later, and it is never transmitted
+/// anywhere except inside their own encrypted roster entry.
+fn generate_display_name() -> Result<String> {
+    const ADJECTIVES: [&str; 12] = [
+        "Swift", "Quiet", "Bright", "Steady", "Nimble", "Calm", "Bold", "Sunny",
+        "Frosty", "Lucky", "Witty", "Noble",
+    ];
+    const NOUNS: [&str; 12] = [
+        "Fox", "Owl", "Wolf", "Heron", "Otter", "Lynx", "Falcon", "Badger",
+        "Hare", "Elk", "Raven", "Marten",
+    ];
+    let mut byte = [0u8; 2];
+    rand_core::OsRng
+        .try_fill_bytes(&mut byte)
+        .map_err(|e| AppError::crypto(format!("OS entropy unavailable: {e}")))?;
+    let [a, n] = byte;
+    let adjective = ADJECTIVES
+        .get(usize::from(a % ADJECTIVES.len() as u8))
+        .copied()
+        .unwrap_or("Swift");
+    let noun = NOUNS
+        .get(usize::from(n % NOUNS.len() as u8))
+        .copied()
+        .unwrap_or("Fox");
+    Ok(format!("{adjective} {noun}"))
+}
+
+fn pack_current_invite(group_state: &GroupState) -> Result<String> {
     let payload = InviteCredentialsPayload {
         version: PROTOCOL_VERSION,
         backend: group_state.backend.kind(),
@@ -2276,7 +2319,7 @@ fn pack_current_invite(group_state: &GroupState, join_password: &str) -> Result<
         group_label: group_state.group_label.clone(),
         key_epoch: group_state.current_epoch(),
     };
-    crypto::pack_invite(&payload, join_password)
+    crypto::pack_invite_v2(&payload)
 }
 
 fn confirm_removals(group_state: &GroupState, remove_pubkeys: &[String]) -> Result<()> {
@@ -2301,7 +2344,6 @@ fn confirm_removals(group_state: &GroupState, remove_pubkeys: &[String]) -> Resu
 /// a secret is being embedded.
 fn build_member_invites(
     group_state: &GroupState,
-    join_password: &str,
     epoch: u8,
     group_key: &[u8; 32],
     excluded: &[String],
@@ -2328,7 +2370,7 @@ fn build_member_invites(
         invites.push(MemberInvite {
             pubkey_b64: member.pubkey_b64.clone(),
             display_name: member.display_name.clone(),
-            invite: crypto::pack_invite(&payload, join_password)?,
+            invite: crypto::pack_invite_v2(&payload)?,
         });
     }
 
@@ -2595,6 +2637,30 @@ mod tests {
         assert_eq!(request.join_password, "pw");
         assert!(request.reason.is_none());
         assert!(request.remove_pubkeys.is_empty());
+    }
+
+    #[test]
+    fn rotate_request_without_a_password_is_accepted() {
+        let request: RotateRequest = serde_json::from_str(r#"{}"#).expect("deserialize");
+        assert!(request.join_password.is_empty());
+        assert!(request.reason.is_none());
+        assert!(request.remove_pubkeys.is_empty());
+    }
+
+    #[test]
+    fn join_request_without_a_name_or_password_is_accepted() {
+        let request: JoinGroupRequest =
+            serde_json::from_str(r#"{"invite":"GRP2-AAAA"}"#).expect("deserialize");
+        assert!(request.join_password.is_empty());
+        assert!(request.display_name.is_empty());
+    }
+
+    #[test]
+    fn generated_display_names_are_friendly_and_unique_enough() {
+        let first = generate_display_name().expect("name");
+        assert!(!first.trim().is_empty());
+        assert!(first.contains(' '));
+        assert!(first.chars().count() <= 32);
     }
 
 

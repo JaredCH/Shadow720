@@ -80,7 +80,8 @@ export interface PreferencesRequest {
 
 export interface CreateNostrGroupRequest {
   groupLabel: string;
-  joinPassword: string;
+  /** Ignored by the current backend; kept so older callers keep working. */
+  joinPassword?: string;
   displayName: string;
   /** Relay URLs. Defaults to the built-in list when empty. */
   relays?: string[];
@@ -99,8 +100,10 @@ export interface CreateNostrGroupResponse {
 
 export interface JoinGroupRequest {
   invite: string;
-  joinPassword: string;
-  displayName: string;
+  /** Required only for legacy `GRP1-` invites. */
+  joinPassword?: string;
+  /** Optional; a friendly name is generated when omitted. */
+  displayName?: string;
 }
 
 export interface JoinGroupResponse {
@@ -405,12 +408,10 @@ export const currentInvite = () => call<string | null>("current_invite");
 /**
  * Pack a fresh group code from the live key.
  *
- * Any member can do this. The join password seals the string and is not stored.
+ * Any member can do this. The code is self-contained: whoever holds it can join.
  */
-export const shareInvite = (joinPassword: string) =>
-  call<{ invite: string; fingerprint: string }>("share_invite", {
-    request: { joinPassword },
-  });
+export const shareInvite = () =>
+  call<{ invite: string; fingerprint: string }>("share_invite");
 
 /** Owner only. `role` is `admin` or `member`. */
 export const setMemberRole = (pubkeyB64: string, role: "admin" | "member") =>
@@ -667,12 +668,11 @@ export const reportContent = (
 export const checkRotation = () => call<RotationStatus | null>("check_rotation");
 
 export const rotateGroupKey = (
-  joinPassword: string,
   removePubkeys: string[],
   reason?: string,
 ) =>
   call<RotateResponse>("rotate_group_key", {
-    request: { joinPassword, removePubkeys, reason: reason ?? null },
+    request: { removePubkeys, reason: reason ?? null },
   });
 
 // -- Leaving -----------------------------------------------------------------
@@ -700,9 +700,9 @@ export const deleteNostrBlob = (sha256: string) =>
 export function describeError(error: AppError): string {
   switch (error.kind) {
     case "invite_password":
-      return "That join password does not match this invite. Check it and try again.";
+      return "That join password does not match this code. Check it and try again.";
     case "invite_format":
-      return `The invite string is not usable: ${error.message}`;
+      return `The invite code is not usable: ${error.message}`;
     case "relay_auth":
       return "A relay rejected this device's key. Re-join the group to get a fresh identity.";
     case "rate_limited":

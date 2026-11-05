@@ -82,8 +82,6 @@ export default function App() {
   const [showGroups, setShowGroups] = useState(false);
   const [showAddGroup, setShowAddGroup] = useState(false);
   const [showPeople, setShowPeople] = useState(false);
-  const [askInvitePassword, setAskInvitePassword] = useState(false);
-  const [invitePassword, setInvitePassword] = useState("");
   const [locationNotice, setLocationNotice] = useState<{
     message: string;
     remedy: LocationRemedy | null;
@@ -639,12 +637,10 @@ export default function App() {
 
   const handleCreateNostrGroup = async (input: {
     groupLabel: string;
-    joinPassword: string;
     displayName: string;
   }) => {
     const response = await api.createNostrGroup({
       groupLabel: input.groupLabel,
-      joinPassword: input.joinPassword,
       displayName: input.displayName,
     });
 
@@ -664,8 +660,8 @@ export default function App() {
 
   const handleJoinGroup = async (input: {
     invite: string;
-    joinPassword: string;
-    displayName: string;
+    joinPassword?: string;
+    displayName?: string;
   }) => {
     const response = await api.joinGroup(input);
     setGroupLabel(response.groupLabel);
@@ -697,18 +693,7 @@ export default function App() {
         });
         return;
       }
-      setInvitePassword("");
-      setAskInvitePassword(true);
-    } catch (thrown) {
-      setBanner(api.toAppError(thrown));
-    }
-  };
-
-  const submitShareInvite = async () => {
-    try {
-      const response = await api.shareInvite(invitePassword);
-      setAskInvitePassword(false);
-      setInvitePassword("");
+      const response = await api.shareInvite();
       setInvite({
         value: response.invite,
         fingerprint: response.fingerprint,
@@ -1162,10 +1147,10 @@ export default function App() {
                             onBlock={handleBlock}
               onRefreshVault={handleRefreshVault}
               onDeleteNostrBlob={handleDeleteNostrBlob}
-              onRotate={async (joinPassword, removePubkeys) => {
+              onRotate={async (removePubkeys) => {
                 const response = await api.rotateGroupKey(
-                  joinPassword,
                   removePubkeys,
+                  "removed by owner",
                 );
                 await loadGroupState();
                 return response.invites;
@@ -1271,9 +1256,8 @@ export default function App() {
             await api.setMemberRole(pubkey, role);
             await loadGroupState();
           }}
-          onKick={async (pubkey, password) => {
+          onKick={async (pubkey) => {
             const response = await api.rotateGroupKey(
-              password,
               [pubkey],
               "removed by owner",
             );
@@ -1283,29 +1267,6 @@ export default function App() {
         />
       ) : null}
 
-      {askInvitePassword ? (
-        <Modal
-          title="Group code"
-          primaryLabel="Show code"
-          onPrimary={() => void submitShareInvite()}
-          secondaryLabel="Cancel"
-          onSecondary={() => setAskInvitePassword(false)}
-          busy={invitePassword.length === 0}
-        >
-          <p>
-            This device does not have a saved group code. Enter the join password
-            to pack one. The recipient needs that password too.
-          </p>
-          <Field
-            label="Join password"
-            type="password"
-            value={invitePassword}
-            onChange={setInvitePassword}
-            autoComplete="current-password"
-          />
-        </Modal>
-      ) : null}
-
       {invite ? (
         <InviteDisplay
           invite={invite.value}
@@ -1313,7 +1274,7 @@ export default function App() {
           label="Group code"
           containsToken={invite.containsToken}
           onDone={() => setInvite(null)}
-          hint="Send this code plus the join password. That is everything a guest needs."
+          hint="Send this code to a friend. It is everything they need to join."
         />
       ) : null}
 
@@ -1330,7 +1291,7 @@ export default function App() {
             messages or positions in this group.
           </p>
           <p className="text-xs text-slate-400">
-            Ask the host for a fresh invite string and join again. Messages sent before
+            Ask the host for a fresh group code and join again. Messages sent before
             the rotation remain readable.
           </p>
         </Modal>
@@ -1450,13 +1411,12 @@ interface GroupSetupProps {
   onCancel?: () => void;
   onCreateNostr: (input: {
     groupLabel: string;
-    joinPassword: string;
     displayName: string;
   }) => Promise<void>;
   onJoin: (input: {
     invite: string;
-    joinPassword: string;
-    displayName: string;
+    joinPassword?: string;
+    displayName?: string;
   }) => Promise<void>;
 }
 
@@ -1478,7 +1438,8 @@ function GroupSetup({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<AppError | null>(null);
 
-  // Join fields.
+  // Join fields. The password field appears only for legacy `GRP1-` codes,
+  // which are sealed with one; a modern `GRP2-` code needs nothing else.
   const [inviteText, setInviteText] = useState("");
   const [joinPassword, setJoinPassword] = useState("");
   const [displayName, setDisplayName] = useState("");
@@ -1486,8 +1447,9 @@ function GroupSetup({
   // Create fields.
   const [provider, setProvider] = useState<ProviderId>("nostr");
   const [label, setLabel] = useState("");
-  const [createPassword, setCreatePassword] = useState("");
   const [createName, setCreateName] = useState("");
+
+  const isLegacyInvite = inviteText.trim().startsWith("GRP1-");
 
   const submitJoin = async () => {
     setError(null);
@@ -1495,8 +1457,8 @@ function GroupSetup({
     try {
       await onJoin({
         invite: inviteText.trim(),
-        joinPassword,
-        displayName: displayName.trim(),
+        joinPassword: isLegacyInvite ? joinPassword : undefined,
+        displayName: displayName.trim() || undefined,
       });
     } catch (thrown) {
       setError(api.toAppError(thrown));
@@ -1512,7 +1474,6 @@ function GroupSetup({
     try {
       await onCreateNostr({
         groupLabel: label.trim() || "My group",
-        joinPassword: createPassword,
         displayName: createName.trim(),
       });
     } catch (thrown) {
@@ -1570,26 +1531,29 @@ function GroupSetup({
         {mode === "join" ? (
           <>
             <TextArea
-              label="Invite string"
+              label="Group code"
               value={inviteText}
               onChange={setInviteText}
-              placeholder="GRP1-…"
+              placeholder="GRP2-…"
               rows={4}
-              hint="Paste the whole string, including the GRP1- prefix."
+              hint="Paste the whole code your friend sent you."
             />
-            <Field
-              label="Join password"
-              type="password"
-              value={joinPassword}
-              onChange={setJoinPassword}
-              placeholder="The group's password"
-              hint="Given to you separately from the invite."
-            />
+            {isLegacyInvite ? (
+              <Field
+                label="Join password"
+                type="password"
+                value={joinPassword}
+                onChange={setJoinPassword}
+                placeholder="The group's password"
+                hint="Older codes need this. New codes do not."
+              />
+            ) : null}
             <Field
               label="Your display name"
               value={displayName}
               onChange={setDisplayName}
               placeholder="Jared"
+              hint="Optional — we pick one for you if you leave it blank."
             />
             <button
               type="button"
@@ -1597,8 +1561,7 @@ function GroupSetup({
               disabled={
                 busy ||
                 inviteText.trim().length === 0 ||
-                joinPassword.length === 0 ||
-                displayName.trim().length === 0
+                (isLegacyInvite && joinPassword.length === 0)
               }
               onClick={() => void submitJoin()}
             >
@@ -1617,27 +1580,16 @@ function GroupSetup({
               placeholder="Weekend trip"
             />
             <Field
-              label="Join password"
-              type="password"
-              value={createPassword}
-              onChange={setCreatePassword}
-              placeholder="Something only your members know"
-              hint="Protects the invite string. Share it out of band."
-            />
-            <Field
               label="Your display name"
               value={createName}
               onChange={setCreateName}
               placeholder="Jared"
+              hint="Optional — we pick one for you if you leave it blank."
             />
             <button
               type="button"
               className="btn-primary w-full"
-              disabled={
-                busy ||
-                createPassword.length === 0 ||
-                createName.trim().length === 0
-              }
+              disabled={busy}
               onClick={() => void submitNostr()}
             >
               {busy ? "Creating…" : "Create group"}

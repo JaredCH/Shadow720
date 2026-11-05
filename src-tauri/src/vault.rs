@@ -168,10 +168,9 @@ pub struct StoredGroup {
     pub is_host: bool,
     #[serde(default)]
     pub uploads: Vec<StoredUpload>,
-    /// Last `GRP1-` string this device packed or joined with.
+    /// Last group code (`GRP2-` or legacy `GRP1-`) this device packed or joined with.
     ///
-    /// Absent on vaults created before invite sharing was saved. The join password
-    /// is not stored; packing a fresh string still requires it.
+    /// Absent on vaults created before invite sharing was saved.
     #[serde(default)]
     pub invite_code: Option<String>,
     /// Host-assigned roles other than owner. Empty means every non-host is a member.
@@ -1173,7 +1172,9 @@ impl SecureVault {
 
     /// Remember the packed invite string on the active group.
     pub fn save_invite_code(&self, code: &str) -> Result<()> {
-        if !code.starts_with(crate::crypto::INVITE_PREFIX) {
+        if !code.starts_with(crate::crypto::INVITE_PREFIX)
+            && !code.starts_with(crate::crypto::INVITE_PREFIX_V2)
+        {
             return Err(AppError::invalid_argument("that is not a group invite string"));
         }
         self.mutate_active_group(|group| {
