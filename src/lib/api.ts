@@ -9,8 +9,8 @@ export type AppErrorKind =
   | "crypto"
   | "invite_format"
   | "invite_password"
-  | "github_api"
-  | "github_auth"
+  | "relay_api"
+  | "relay_auth"
   | "rate_limited"
   | "network"
   | "response_parse"
@@ -50,7 +50,7 @@ export interface UnlockRequest {
 export interface UnlockResponse {
   existed: boolean;
   groupConfigured: boolean;
-  repoFullName: string | null;
+  groupRef: string | null;
   currentEpoch: number | null;
   requiresRecovery: boolean;
 }
@@ -78,29 +78,6 @@ export interface PreferencesRequest {
   enabledBackgroundLocation: boolean;
 }
 
-export interface BeginSignInRequest {
-  /** Include the destructive `delete_repo` scope so "Destroy Group" works. */
-  allowDestroy: boolean;
-}
-
-export interface BeginSignInResponse {
-  /** Short code the user types at `verificationUri`. */
-  userCode: string;
-  /** Page the user should open. */
-  verificationUri: string;
-  /** Seconds until the code expires. */
-  expiresIn: number;
-  /** Minimum seconds between polls. */
-  interval: number;
-}
-
-export interface SignInResponse {
-  login: string;
-  scope: string;
-  /** True when `delete_repo` was granted, so Destroy Group will work. */
-  canDestroy: boolean;
-}
-
 export interface CreateNostrGroupRequest {
   groupLabel: string;
   joinPassword: string;
@@ -120,54 +97,6 @@ export interface CreateNostrGroupResponse {
   nostrPubkey: string;
 }
 
-export interface ProvisionRequest {
-  /**
-   * Account-scoped token, for callers that paste one instead of signing in.
-   * Ignored when a sign-in has already completed.
-   */
-  accountToken?: string | null;
-  /** Repository name. Generated when empty. */
-  repoName?: string | null;
-  /** Release tag for the vault. Defaults to `vault-v1`. */
-  releaseTag?: string | null;
-}
-
-export interface ProvisionResponse {
-  repoOwner: string;
-  repoName: string;
-  repoFullName: string;
-  rosterIssueNum: number;
-  chatIssueNum: number;
-  releaseId: number;
-  accountLogin: string;
-}
-
-export interface CreateGroupRequest {
-  repoOwner: string;
-  repoName: string;
-  repoScopedPat: string;
-  groupLabel: string;
-  joinPassword: string;
-  displayName: string;
-  /** `0` creates a roster issue and uses its number. */
-  rosterIssueNum: number;
-  /** `0` creates a chat issue and uses its number. */
-  chatIssueNum: number;
-  releaseId?: number;
-  releaseTag?: string | null;
-  /** True when `provisionRepository` created this repository. */
-  repoCreated?: boolean;
-}
-
-export interface CreateGroupResponse {
-  invite: string;
-  fingerprint: string;
-  repoFullName: string;
-  tokenLogin: string;
-  hasAdminScope: boolean;
-  releaseId: number;
-}
-
 export interface JoinGroupRequest {
   invite: string;
   joinPassword: string;
@@ -175,11 +104,8 @@ export interface JoinGroupRequest {
 }
 
 export interface JoinGroupResponse {
-  repoFullName: string;
+  groupRef: string;
   groupLabel: string;
-  rosterIssueNum: number;
-  chatIssueNum: number;
-  releaseId: number;
   keyEpoch: number;
   fingerprint: string;
   alreadyMember: boolean;
@@ -338,20 +264,13 @@ export interface RotateResponse {
   groupInvite: string;
 }
 
-export interface RekeyResponse {
-  tokenValid: boolean;
-  tokenLogin: string;
-  invites: MemberInvite[];
-  keyEpoch: number;
-}
-
 export interface WipeResponse {
   rosterCommentDeleted: boolean;
   vaultWiped: boolean;
 }
 
 export interface DestroyResponse {
-  repoFullName: string;
+  groupRef: string;
   vaultWiped: boolean;
   acceptedRelays: string[];
   unconfirmedRelays: string[];
@@ -362,7 +281,7 @@ export interface DiagnosticsResponse {
   backend: string;
   /** True when the backend needs no account. */
   accountless: boolean;
-  repoFullName: string;
+  groupRef: string;
   groupLabel: string;
   isHost: boolean;
   currentEpoch: number;
@@ -553,33 +472,6 @@ export const openLocationSettings = (appPage: boolean) =>
 // -- Group lifecycle --------------------------------------------------------
 
 /**
- * Start an account sign-in and get the code to show the user.
- *
- * Fine-grained PATs cannot be created through the API, so the device flow is the
- * only way to keep setup inside the app: one button, a short code, and the user
- * approves on whatever device they already have.
- */
-export const beginSignIn = (allowDestroy: boolean) =>
-  call<BeginSignInResponse>("begin_sign_in", { request: { allowDestroy } });
-
-/**
- * Poll once for a completed sign-in.
- *
- * Resolves to `null` while the user has not approved yet, so the caller can keep
- * a spinner running without treating "not yet" as an error. The polling secret
- * stays in Rust; this takes no arguments.
- */
-export const pollSignIn = () => call<SignInResponse | null>("poll_sign_in");
-
-/**
- * Create the repository, both schema issues, and the vault release.
- *
- * Uses the token from a completed sign-in, which never crosses into the webview.
- */
-export const provisionRepository = (request: ProvisionRequest) =>
-  call<ProvisionResponse>("provision_repository", { request });
-
-/**
  * Create a group on Nostr: no account, no token, no repository.
  *
  * The identity is a keypair generated on this device, so there is nothing to
@@ -588,9 +480,6 @@ export const provisionRepository = (request: ProvisionRequest) =>
  */
 export const createNostrGroup = (request: CreateNostrGroupRequest) =>
   call<CreateNostrGroupResponse>("create_nostr_group", { request });
-
-export const createGroup = (request: CreateGroupRequest) =>
-  call<CreateGroupResponse>("create_group", { request });
 
 export const joinGroup = (request: JoinGroupRequest) =>
   call<JoinGroupResponse>("join_group", { request });
@@ -755,15 +644,6 @@ export const rotateGroupKey = (
     request: { joinPassword, removePubkeys, reason: reason ?? null },
   });
 
-export const rekeyGroup = (
-  newPat: string,
-  joinPassword: string,
-  releaseTag?: string,
-) =>
-  call<RekeyResponse>("rekey_group", {
-    request: { newPat, joinPassword, releaseTag: releaseTag ?? null },
-  });
-
 // -- Leaving -----------------------------------------------------------------
 
 export const leaveAndWipe = () => call<WipeResponse>("leave_and_wipe");
@@ -792,10 +672,10 @@ export function describeError(error: AppError): string {
       return "That join password does not match this invite. Check it and try again.";
     case "invite_format":
       return `The invite string is not usable: ${error.message}`;
-    case "github_auth":
-      return "GitHub rejected the token. It may have expired, or lack the required scopes.";
+    case "relay_auth":
+      return "A relay rejected this device's key. Re-join the group to get a fresh identity.";
     case "rate_limited":
-      return "GitHub rate limit reached. Sync resumes automatically; no action needed.";
+      return "A relay is rate limiting this device. Sync resumes automatically; no action needed.";
     case "vault_unavailable":
       // The underlying message distinguishes a genuinely invalidated device key
       // from a keystore or filesystem failure. Replacing it with one generic
@@ -803,10 +683,10 @@ export function describeError(error: AppError): string {
       return `The secure vault cannot be opened on this device: ${error.message}`;
     case "payload_too_large":
       return "That file is too large to share. The limit is 15 MB.";
-    case "github_api":
-      return `GitHub refused the request: ${error.message}`;
+    case "relay_api":
+      return `A relay refused the request: ${error.message}`;
     case "network":
-      return "Could not reach GitHub. Check the connection and try again.";
+      return "Could not reach a relay. Check the connection and try again.";
     default:
       return error.message;
   }
@@ -816,7 +696,7 @@ export function describeError(error: AppError): string {
 export function isBlocking(error: AppError): boolean {
   return (
     error.kind === "vault_unavailable" ||
-    error.kind === "github_auth" ||
+    error.kind === "relay_auth" ||
     error.kind === "invite_format"
   );
 }

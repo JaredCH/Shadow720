@@ -153,14 +153,14 @@ interface InviteDisplayProps {
   onDone: () => void;
   /** Short explanation of what the recipient must do. */
   hint?: string;
-  /** GitHub invites embed the group token. Nostr invites do not. */
+  /** True when the invite embeds a shared credential. Nostr invites do not. */
   containsToken?: boolean;
 }
 
 /**
  * Shows an invite string with a copy button.
  *
- * The invite carries the group's PAT, so it is displayed only on request and with
+ * The invite carries the group key, so it is displayed only on request and with
  * a warning rather than being left on screen.
  */
 export function InviteDisplay({
@@ -193,9 +193,8 @@ export function InviteDisplay({
           </div>
           {containsToken ? (
             <p className="text-xs text-amber-300">
-              This string contains the group's GitHub token. Anyone holding it can read
-              the group and delete the repository. Share it only with people you trust,
-              over a channel you trust.
+              This string contains a shared credential. Anyone holding it can read the
+              group. Share it only with people you trust, over a channel you trust.
             </p>
           ) : (
             <p className="text-xs text-amber-300">

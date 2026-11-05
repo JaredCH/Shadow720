@@ -2,13 +2,13 @@
 //!
 //! # Why this exists
 //!
-//! GitHub requires an account, and the invite has to carry a token that can
-//! destroy the repository. Nostr removes both problems:
+//! Relays need no account, and the invite carries no credential that could be
+//! used to destroy the group's storage. Nostr removes both problems:
 //!
 //! * Identity is a secp256k1 keypair generated on the device. No email, no
 //!   signup, no OAuth app, no token to paste.
 //! * Relays store opaque events. They cannot read anything, and there is no
-//!   repository for a guest to delete.
+//!   shared store for a guest to delete.
 //! * Relays push over WebSocket, so the polling machinery in [`crate::geo_filter`]
 //!   is not needed on this path.
 //!
@@ -29,7 +29,7 @@
 //!
 //! Addressable events (kind 30000–39999) are replaceable per
 //! `(pubkey, kind, d-tag)`, which is exactly the "each member owns one slot"
-//! property the GitHub schema got from one comment per member.
+//! property the group schema needs: one event per member.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

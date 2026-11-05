@@ -1,9 +1,9 @@
 //! Cryptographic core: group keys, invite tokens, and the `EncryptedEnvelope`
 //! wire format.
 //!
-//! GitHub is treated as an **untrusted ciphertext store**. Nothing in this module
+//! Relays are treated as an **untrusted ciphertext store**. Nothing in this module
 //! may emit plaintext to the network, and nothing may panic on hostile input:
-//! every byte arriving from GitHub, from an invite string, or from local storage
+//! every byte arriving from a relay, from an invite string, or from local storage
 //! is treated as attacker-controlled.
 //!
 //! Primitives
@@ -144,54 +144,40 @@ pub fn verifying_key_for_secret_b64(secret_b64: &str) -> Result<VerifyingKey> {
 
 /// Everything a guest needs to join, sealed inside a `GRP1-` invite string.
 ///
-/// Carries the repo-scoped PAT, so this struct is zeroized on drop and must never
+/// Carries the group master key, so this struct is zeroized on drop and must never
 /// be logged or serialized to disk in the clear.
 #[derive(Clone, Debug, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct InviteCredentialsPayload {
     pub version: u8,
     /// Which storage backend holds this group.
     ///
-    /// Defaulted to GitHub so an invite written before the field existed still
-    /// parses as the backend it was actually created on.
+    /// Kept as a field so an invite written by a build that shipped a different
+    /// backend fails to parse loudly instead of being misread as Nostr.
     #[serde(default)]
     pub backend: crate::storage::BackendKind,
-    pub repo_owner: String,
-    pub repo_name: String,
-    /// Fine-grained PAT scoped to this single repository.
-    ///
-    /// Empty on the Nostr backend, where each member signs with its own key and
-    /// there is no shared credential to embed.
-    #[serde(default)]
-    pub repo_scoped_pat: String,
-    pub group_master_key: [u8; GROUP_KEY_LEN],
-    pub roster_issue_num: u64,
-    pub chat_issue_num: u64,
-    pub release_id: u64,
-    /// True when the app provisioned the repository, false when it adopted an
-    /// existing one (`PLAN_ADDENDUM_v1.md` §A1).
-    pub repo_created: bool,
-    /// Relay URLs, on the Nostr backend.
-    #[serde(default)]
-    pub relays: Vec<String>,
-    /// Blossom servers for blobs, on the Nostr backend.
-    #[serde(default)]
-    pub blossom_servers: Vec<String>,
     /// Group id, used as the `d` tag on every Nostr event.
     #[serde(default)]
     pub group_id: String,
+    pub group_master_key: [u8; GROUP_KEY_LEN],
+    /// Relay URLs.
+    #[serde(default)]
+    pub relays: Vec<String>,
+    /// Blossom servers for blobs.
+    #[serde(default)]
+    pub blossom_servers: Vec<String>,
     /// Host's Ed25519 public key, pinned at join time so the roster can be verified.
     pub host_pubkey: String,
     /// Human label for the group, shown before the user commits to joining.
     pub group_label: String,
-        /// Group-key epoch this invite's `group_master_key` belongs to.
-        ///
-        /// `0` for the original invite. A re-issue after a rotation carries the new
-        /// epoch, which is how a member learns that a rotation happened
-        /// (`PLAN_ADDENDUM_v1.md` §A3). Defaulted so an invite written before the
-        /// field existed still parses as epoch 0.
-        #[serde(default)]
-        pub key_epoch: u8,
-    }
+    /// Group-key epoch this invite's `group_master_key` belongs to.
+    ///
+    /// `0` for the original invite. A re-issue after a rotation carries the new
+    /// epoch, which is how a member learns that a rotation happened
+    /// (`PLAN_ADDENDUM_v1.md` §A3). Defaulted so an invite written before the
+    /// field existed still parses as epoch 0.
+    #[serde(default)]
+    pub key_epoch: u8,
+}
 
 impl InviteCredentialsPayload {
     /// Borrow the group key as a plain array for crypto calls.
@@ -199,17 +185,10 @@ impl InviteCredentialsPayload {
         &self.group_master_key
     }
 
-    /// `owner/name`, the form GitHub's API expects.
-    pub fn repo_full_name(&self) -> String {
-        format!("{}/{}", self.repo_owner, self.repo_name)
-    }
-
     /// Validate shape and version before use. Cheap checks only; the AEAD tag is
     /// what actually guarantees authenticity.
     ///
-    /// The required fields differ per backend: GitHub needs a repository, a
-    /// token, and schema issue numbers; Nostr needs a group id and relays, and
-    /// deliberately carries no token.
+    /// Nostr needs a group id and relays, and deliberately carries no token.
     pub fn validate(&self) -> Result<()> {
         if self.version != PROTOCOL_VERSION {
             return Err(AppError::InviteFormat(format!(
@@ -219,24 +198,6 @@ impl InviteCredentialsPayload {
         }
 
         match self.backend {
-            crate::storage::BackendKind::GitHub => {
-                if self.repo_owner.trim().is_empty() || self.repo_name.trim().is_empty() {
-                    return Err(AppError::InviteFormat("invite has an empty repo name".into()));
-                }
-                if self.repo_scoped_pat.trim().is_empty() {
-                    return Err(AppError::InviteFormat("invite has an empty token".into()));
-                }
-                if self.roster_issue_num == 0 || self.chat_issue_num == 0 {
-                    return Err(AppError::InviteFormat(
-                        "invite references issue number 0, which cannot exist".into(),
-                    ));
-                }
-                if self.release_id == 0 {
-                    return Err(AppError::InviteFormat(
-                        "invite has no vault release id".into(),
-                    ));
-                }
-            }
             crate::storage::BackendKind::Nostr => {
                 if self.group_id.trim().is_empty() {
                     return Err(AppError::InviteFormat(
@@ -528,7 +489,7 @@ pub struct RoleGrant {
 // Envelope
 // ---------------------------------------------------------------------------
 
-/// The `EncryptedEnvelope`: exactly what is stored on GitHub.
+/// The `EncryptedEnvelope`: exactly what is stored on a relay.
 ///
 /// Field order mirrors the signed input so the canonicalizer and the struct stay
 /// in lockstep. Base64 fields are **standard, padded**.
@@ -1081,37 +1042,22 @@ mod tests {
     fn sample_payload() -> InviteCredentialsPayload {
         InviteCredentialsPayload {
             version: PROTOCOL_VERSION,
-            backend: crate::storage::BackendKind::GitHub,
-            repo_owner: "JaredCH".into(),
-            repo_name: "shadow720-sandbox".into(),
-            repo_scoped_pat: "github_pat_TESTVALUE".into(),
+            backend: crate::storage::BackendKind::Nostr,
+            group_id: "group-abc".into(),
             group_master_key: [7u8; GROUP_KEY_LEN],
-            roster_issue_num: 1,
-            chat_issue_num: 2,
-            release_id: 123456,
-            repo_created: true,
-            relays: Vec::new(),
-            blossom_servers: Vec::new(),
-            group_id: String::new(),
+            relays: vec!["wss://relay.damus.io".into()],
+            blossom_servers: vec!["https://blossom.nostr.build".into()],
             host_pubkey: verifying_key_to_b64(&new_signing_key().expect("keygen").1),
             group_label: "Weekend Trip".into(),
-                key_epoch: 0,
-            }
+            key_epoch: 0,
         }
+    }
 
     fn sample_nostr_payload() -> InviteCredentialsPayload {
         InviteCredentialsPayload {
             version: PROTOCOL_VERSION,
             backend: crate::storage::BackendKind::Nostr,
-            repo_owner: String::new(),
-            repo_name: String::new(),
-            // Deliberately empty: the Nostr backend embeds no credential.
-            repo_scoped_pat: String::new(),
             group_master_key: [9u8; GROUP_KEY_LEN],
-            roster_issue_num: 0,
-            chat_issue_num: 0,
-            release_id: 0,
-            repo_created: true,
             relays: vec!["wss://relay.damus.io".into(), "wss://nos.lol".into()],
             blossom_servers: vec!["https://blossom.nostr.build".into()],
             group_id: "group-abc".into(),
@@ -1133,8 +1079,8 @@ mod tests {
         assert_eq!(recovered.group_id, "group-abc");
         assert_eq!(recovered.relays.len(), 2);
         assert!(
-            recovered.repo_scoped_pat.is_empty(),
-            "a Nostr invite must not carry a credential"
+            recovered.group_master_key == [9u8; GROUP_KEY_LEN],
+            "the group key must survive the round trip"
         );
     }
 
@@ -1160,20 +1106,33 @@ mod tests {
     }
 
     #[test]
-    fn github_invite_still_requires_a_token() {
+    fn a_nostr_invite_without_relays_is_rejected() {
         let mut payload = sample_payload();
-        payload.repo_scoped_pat = String::new();
+        payload.relays.clear();
         assert!(
             payload.validate().is_err(),
-            "the GitHub backend cannot work without a token"
+            "a group with no relays cannot be reached"
         );
     }
 
     #[test]
-    fn an_invite_without_a_backend_field_parses_as_github() {
-        // Backwards compatibility: invites written before the field existed.
+    fn a_nostr_invite_without_a_group_id_is_rejected() {
+        let mut payload = sample_payload();
+        payload.group_id = String::new();
+        assert!(
+            payload.validate().is_err(),
+            "no group id means no event can be addressed"
+        );
+    }
+
+    #[test]
+    fn an_invite_naming_a_removed_backend_fails_to_parse() {
+        // An invite written by a build that shipped the GitHub backend must not be
+        // silently reinterpreted as Nostr: it would point at a store this build
+        // cannot reach.
         let json = serde_json::json!({
             "version": PROTOCOL_VERSION,
+            "backend": "github",
             "repo_owner": "o",
             "repo_name": "r",
             "repo_scoped_pat": "github_pat_X",
@@ -1186,10 +1145,10 @@ mod tests {
             "group_label": "g",
             "key_epoch": 0
         });
-        let payload: InviteCredentialsPayload =
-            serde_json::from_value(json).expect("deserialize");
-        assert_eq!(payload.backend, crate::storage::BackendKind::GitHub);
-        assert!(payload.relays.is_empty());
+        assert!(
+            serde_json::from_value::<InviteCredentialsPayload>(json).is_err(),
+            "a github invite must be rejected, not coerced to nostr"
+        );
     }
 
     fn sample_location() -> LocationState {
@@ -1217,11 +1176,9 @@ mod tests {
         assert!(token.starts_with(INVITE_PREFIX));
 
         let recovered = unpack_invite(&token, "correct horse battery staple").expect("unpack");
-        assert_eq!(recovered.repo_owner, "JaredCH");
-        assert_eq!(recovered.repo_name, "shadow720-sandbox");
+        assert_eq!(recovered.group_id, "group-abc");
         assert_eq!(recovered.group_master_key, [7u8; GROUP_KEY_LEN]);
-        assert_eq!(recovered.release_id, 123456);
-        assert!(recovered.repo_created);
+        assert_eq!(recovered.relays, vec!["wss://relay.damus.io".to_string()]);
         assert_eq!(recovered.group_label, "Weekend Trip");
     }
 
@@ -1282,21 +1239,21 @@ mod tests {
     #[test]
     fn invite_requires_valid_fields() {
         let mut payload = sample_payload();
-        payload.repo_name.clear();
+        payload.group_id.clear();
         assert_eq!(
             payload.validate().expect_err("must fail").kind(),
             crate::error::AppErrorKind::InviteFormat
         );
 
         let mut payload = sample_payload();
-        payload.release_id = 0;
+        payload.relays.clear();
         assert_eq!(
             payload.validate().expect_err("must fail").kind(),
             crate::error::AppErrorKind::InviteFormat
         );
 
         let mut payload = sample_payload();
-        payload.repo_scoped_pat = "   ".into();
+        payload.relays = vec!["https://relay.example".into()];
         assert_eq!(
             payload.validate().expect_err("must fail").kind(),
             crate::error::AppErrorKind::InviteFormat

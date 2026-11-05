@@ -1,4 +1,4 @@
-//! Secure at-rest storage for the two secrets that matter: the repo-scoped PAT
+//! Secure at-rest storage for the two secrets that matter: the Nostr signing secret
 //! and the group master key.
 //!
 //! # Why not Stronghold
@@ -8,7 +8,8 @@
 //!
 //! 1. **Vault records are not readable.** `ClientVault::read_secret` is
 //!    `#[cfg(test)]` only, by design: records are meant to be used, never
-//!    extracted. A PAT has to be handed to an HTTP client, so it must be readable.
+//!    extracted. A signing secret has to be handed to the relay client, so it must be
+//!    readable.
 //! 2. **Snapshot writes take ~100 seconds on Windows.** Stronghold's runtime is
 //!    built on its own hardened shared-memory allocator; a single
 //!    `commit_with_keyprovider` for a 32-byte payload measured 103 s on this
@@ -35,7 +36,7 @@
 //!   │ AES-GCM key  │ ──wraps──▶ │ 32-byte vault pass  │
 //!   │ hardware-    │            │         │           │
 //!   │ backed       │            │         ▼           │
-//!   └──────────────┘            │  PAT + group_key    │
+//!   └──────────────┘            │ secret + group_key  │
 //!                               └─────────────────────┘
 //! ```
 //!
@@ -95,8 +96,8 @@ const VAULT_AAD: &[u8] = b"shadow720/vault/payload/v1";
 struct VaultPayload {
     /// Schema version, so a future layout change can migrate rather than fail.
     version: u8,
-    /// Secret of the *active* group: a PAT on GitHub, a Nostr secret on Nostr.
-    pat: String,
+    /// Secret of the *active* group: the Nostr signing secret.
+    secret: String,
     /// Group master key for the active group's current epoch.
     group_key: [u8; GROUP_KEY_LEN],
     #[serde(default)]
@@ -115,12 +116,12 @@ struct VaultPayload {
 /// One group's complete local state, so switching needs no re-join.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StoredGroupSlot {
-    /// Stable identifier: the Nostr group id, or `owner/name` on GitHub.
+    /// Stable identifier: the Nostr group id.
     pub id: String,
     /// Human label, shown in the group switcher.
     pub label: String,
-    /// PAT or Nostr secret for this group.
-    pub pat: String,
+    /// Nostr signing secret for this group.
+    pub secret: String,
     /// Group master key for this group's current epoch.
     pub group_key: [u8; GROUP_KEY_LEN],
     /// Descriptor describing this group.
@@ -133,7 +134,7 @@ pub struct StoredGroupSlot {
 impl Drop for StoredGroupSlot {
     fn drop(&mut self) {
         use zeroize::Zeroize;
-        self.pat.zeroize();
+        self.secret.zeroize();
         self.group_key.zeroize();
     }
 }
@@ -143,7 +144,7 @@ impl std::fmt::Debug for StoredGroupSlot {
         f.debug_struct("StoredGroupSlot")
             .field("id", &self.id)
             .field("label", &self.label)
-            .field("pat", &"[REDACTED]")
+            .field("secret", &"[REDACTED]")
             .finish_non_exhaustive()
     }
 }
@@ -210,7 +211,7 @@ impl std::fmt::Debug for VaultPayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VaultPayload")
             .field("version", &self.version)
-            .field("pat", &"[REDACTED]")
+            .field("secret", &"[REDACTED]")
             .field("group_key", &"[REDACTED]")
             .finish()
     }
@@ -719,7 +720,7 @@ impl Keystore for InMemoryKeystore {
 
 /// The two secrets the app cannot function without.
 pub struct VaultContents {
-    pub pat: String,
+    pub secret: String,
     pub group_key: GroupKey,
 }
 
@@ -727,7 +728,7 @@ impl std::fmt::Debug for VaultContents {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never render either secret.
         f.debug_struct("VaultContents")
-            .field("pat", &"[REDACTED]")
+            .field("secret", &"[REDACTED]")
             .field("group_key", &"[REDACTED]")
             .finish()
     }
@@ -741,9 +742,9 @@ pub struct VaultDescriptor {
     /// Keystore alias the password was wrapped with, so a mismatched device is
     /// detected with a clear message instead of a cipher error.
     pub keystore_alias: String,
-    /// Repo the stored PAT is scoped to. Lets the app detect "you joined a
+    /// Stable group identifier. Lets the app detect "you joined a
     /// different group" without touching the vault.
-    pub repo_full_name: String,
+    pub group_ref: String,
     /// Key epoch currently believed to be authoritative.
     pub current_epoch: u8,
 }
@@ -753,14 +754,13 @@ pub const DESCRIPTOR_VERSION: u8 = 1;
 
 /// Stable identifier for a group, derived from its descriptor.
 ///
-/// The Nostr backend already has a real group id; GitHub groups are identified by
-/// their repository, which is unique per group by construction.
+/// The descriptor stores the group id with a `nostr:` prefix so a future backend\n/// can be told apart from it without a schema change.
 pub fn group_id_for(descriptor: &VaultDescriptor) -> String {
     descriptor
-        .repo_full_name
+        .group_ref
         .strip_prefix("nostr:")
         .map(|id| id.to_string())
-        .unwrap_or_else(|| descriptor.repo_full_name.clone())
+        .unwrap_or_else(|| descriptor.group_ref.clone())
 }
 
 /// Sealed-vault storage: an AEAD-encrypted payload plus a Keystore-wrapped password.
@@ -898,13 +898,13 @@ impl SecureVault {
         match guard.as_ref() {
             None => Ok(None),
             Some(payload) => {
-                if payload.pat.trim().is_empty() {
+                if payload.secret.trim().is_empty() {
                     return Err(AppError::vault(
                         "vault holds a group key but no token; re-join the group",
                     ));
                 }
                 Ok(Some(VaultContents {
-                    pat: payload.pat.clone(),
+                    secret: payload.secret.clone(),
                     group_key: Zeroizing::new(payload.group_key),
                 }))
             }
@@ -927,7 +927,7 @@ impl SecureVault {
         descriptor: &VaultDescriptor,
         group: Option<StoredGroup>,
     ) -> Result<()> {
-        if contents.pat.trim().is_empty() {
+        if contents.secret.trim().is_empty() {
             return Err(AppError::not_configured(
                 "a token is required before the vault can be populated",
             ));
@@ -939,8 +939,8 @@ impl SecureVault {
             label: group
                 .as_ref()
                 .map(|stored| stored.invite.group_label.clone())
-                .unwrap_or_else(|| descriptor.repo_full_name.clone()),
-            pat: contents.pat.clone(),
+                .unwrap_or_else(|| descriptor.group_ref.clone()),
+            secret: contents.secret.clone(),
             group_key: *contents.group_key,
             descriptor: descriptor.clone(),
             group: group.clone(),
@@ -958,7 +958,7 @@ impl SecureVault {
 
         let payload = VaultPayload {
             version: VAULT_FORMAT_VERSION,
-            pat: contents.pat.clone(),
+            secret: contents.secret.clone(),
             group_key: *contents.group_key,
             group,
             groups,
@@ -983,7 +983,7 @@ impl SecureVault {
             .map(|slot| GroupSummary {
                 id: slot.id.clone(),
                 label: slot.label.clone(),
-                backend: slot.descriptor.repo_full_name.clone(),
+                backend: slot.descriptor.group_ref.clone(),
                 is_active: payload.active_group.as_deref() == Some(slot.id.as_str()),
             })
             .collect()
@@ -1005,18 +1005,18 @@ impl SecureVault {
             .ok_or_else(|| AppError::invalid_argument("that group is not stored on this device"))?;
 
         let previous = (
-            payload.pat.clone(),
+            payload.secret.clone(),
             payload.group_key,
             payload.group.clone(),
             payload.active_group.clone(),
         );
-        payload.pat = slot.pat.clone();
+        payload.secret = slot.secret.clone();
         payload.group_key = slot.group_key;
         payload.group = slot.group.clone();
         payload.active_group = Some(slot.id.clone());
 
         if let Err(error) = self.write_payload(payload) {
-            payload.pat = previous.0;
+            payload.secret = previous.0;
             payload.group_key = previous.1;
             payload.group = previous.2;
             payload.active_group = previous.3;
@@ -1024,7 +1024,7 @@ impl SecureVault {
         }
 
         let contents = VaultContents {
-            pat: slot.pat.clone(),
+            secret: slot.secret.clone(),
             group_key: zeroize::Zeroizing::new(slot.group_key),
         };
         let descriptor = slot.descriptor.clone();
@@ -1048,7 +1048,7 @@ impl SecureVault {
         let was_active = payload.active_group.as_deref() == Some(id);
         if was_active {
             payload.active_group = None;
-            payload.pat.clear();
+            payload.secret.clear();
             payload.group_key = [0u8; GROUP_KEY_LEN];
             payload.group = None;
         }
@@ -1157,10 +1157,10 @@ impl SecureVault {
 
     /// Replace only the token, keeping the group key.
     ///
-    /// Used by the "Re-key Group" flow when a PAT expires
+    /// Used by the "Re-key Group" flow when a secret expires
     /// (`PLAN_ADDENDUM_v1.md` §A3).
-    pub fn update_pat(&self, pat: &str, descriptor: &VaultDescriptor) -> Result<()> {
-        if pat.trim().is_empty() {
+    pub fn update_secret(&self, secret: &str, descriptor: &VaultDescriptor) -> Result<()> {
+        if secret.trim().is_empty() {
             return Err(AppError::invalid_argument("a replacement token is required"));
         }
 
@@ -1173,7 +1173,7 @@ impl SecureVault {
                 ))
             }
         };
-        payload.pat = pat.to_string();
+        payload.secret = secret.to_string();
         self.write_payload(&payload)?;
 
         *guard = Some(payload);
@@ -1476,14 +1476,14 @@ mod tests {
         VaultDescriptor {
             version: DESCRIPTOR_VERSION,
             keystore_alias: IN_MEMORY_ALIAS.to_string(),
-            repo_full_name: repo.to_string(),
+            group_ref: repo.to_string(),
             current_epoch: 0,
         }
     }
 
     fn contents() -> VaultContents {
         VaultContents {
-            pat: "github_pat_TEST".to_string(),
+            secret: "nostr_secret_TEST".to_string(),
             group_key: Zeroizing::new([7u8; GROUP_KEY_LEN]),
         }
     }
@@ -1495,11 +1495,11 @@ mod tests {
         let vault = SecureVault::create(&dir, keystore).expect("create");
 
         let first = VaultContents {
-            pat: "nostr-secret-one".to_string(),
+            secret: "nostr-secret-one".to_string(),
             group_key: Zeroizing::new([1u8; GROUP_KEY_LEN]),
         };
         let second = VaultContents {
-            pat: "nostr-secret-two".to_string(),
+            secret: "nostr-secret-two".to_string(),
             group_key: Zeroizing::new([2u8; GROUP_KEY_LEN]),
         };
         vault
@@ -1520,9 +1520,9 @@ mod tests {
 
         // Switching restores the other group's own secret and key.
         let (contents, descriptor, _) = vault.activate_group("group-one").expect("activate");
-        assert_eq!(contents.pat, "nostr-secret-one");
+        assert_eq!(contents.secret, "nostr-secret-one");
         assert_eq!(*contents.group_key, [1u8; GROUP_KEY_LEN]);
-        assert_eq!(descriptor.repo_full_name, "nostr:group-one");
+        assert_eq!(descriptor.group_ref, "nostr:group-one");
         assert_eq!(
             vault.list_groups().iter().find(|group| group.is_active).map(|group| group.id.as_str()),
             Some("group-one")
@@ -1568,14 +1568,7 @@ mod tests {
             invite: crate::crypto::InviteCredentialsPayload {
                 version: crate::crypto::PROTOCOL_VERSION,
                 backend: crate::storage::BackendKind::Nostr,
-                repo_owner: String::new(),
-                repo_name: String::new(),
-                repo_scoped_pat: String::new(),
                 group_master_key: [7; GROUP_KEY_LEN],
-                roster_issue_num: 0,
-                chat_issue_num: 0,
-                release_id: 0,
-                repo_created: true,
                 relays: vec!["wss://relay.example".into()],
                 blossom_servers: vec!["https://blossom.example".into()],
                 group_id: "private-group".into(),
@@ -1871,10 +1864,10 @@ mod tests {
 
         let reopened = SecureVault::open(&dir, keystore).expect("open");
         let loaded = reopened.load_contents().expect("load").expect("present");
-        assert_eq!(loaded.pat, "github_pat_TEST");
+        assert_eq!(loaded.secret, "nostr_secret_TEST");
         assert_eq!(*loaded.group_key, [7u8; GROUP_KEY_LEN]);
         assert_eq!(
-            reopened.descriptor().expect("descriptor").repo_full_name,
+            reopened.descriptor().expect("descriptor").group_ref,
             "JaredCH/sandbox"
         );
         reopened.verify_descriptor().expect("descriptor verifies");
@@ -1894,8 +1887,8 @@ mod tests {
         let raw = std::fs::read(vault.vault_path()).expect("read");
         let haystack = String::from_utf8_lossy(&raw);
         assert!(
-            !haystack.contains("github_pat_TEST"),
-            "the PAT must never appear in the vault file"
+            !haystack.contains("nostr_secret_TEST"),
+            "the secret must never appear in the vault file"
         );
         assert!(
             !raw.windows(GROUP_KEY_LEN).any(|w| w == [7u8; GROUP_KEY_LEN]),
@@ -2140,7 +2133,7 @@ mod tests {
         let second = SecureVault::open_or_create(&dir, keystore).expect("second");
         let loaded = second.load_contents().expect("load").expect("present");
         assert_eq!(
-            loaded.pat, "github_pat_TEST",
+            loaded.secret, "nostr_secret_TEST",
             "existing vault must be reused"
         );
 
@@ -2173,7 +2166,7 @@ mod tests {
         let vault = SecureVault::create(&dir, keystore).expect("create");
 
         let mut bad = contents();
-        bad.pat = "   ".to_string();
+        bad.secret = "   ".to_string();
         let err = vault
             .store_contents(&bad, &descriptor_for("o/r"))
             .expect_err("must fail");
@@ -2184,14 +2177,14 @@ mod tests {
 
     #[test]
     fn store_writes_a_payload_that_rejects_a_blank_token_on_read() {
-        let dir = scratch("blankpat");
+        let dir = scratch("blanksecret");
         let keystore: Arc<dyn Keystore> = Arc::new(InMemoryKeystore::new().expect("keystore"));
         let vault = SecureVault::create(&dir, keystore).expect("create");
 
         // Bypass the store guard to prove the read path also refuses a blank token.
         let payload = VaultPayload {
             version: VAULT_FORMAT_VERSION,
-            pat: String::new(),
+            secret: String::new(),
             group_key: [1u8; GROUP_KEY_LEN],
             group: None,
             groups: Vec::new(),
@@ -2286,14 +2279,14 @@ mod tests {
     fn descriptor_carries_no_secrets() {
         let json = serde_json::to_string(&descriptor_for("o/r")).expect("serialize");
         assert!(!json.contains("ghp_"));
-        assert!(!json.contains("github_pat_"));
+        assert!(!json.contains("nostr_secret_"));
     }
 
     // -- Updates -------------------------------------------------------------
 
     #[test]
-    fn update_pat_keeps_the_group_key() {
-        let dir = scratch("updatepat");
+    fn update_secret_keeps_the_group_key() {
+        let dir = scratch("updatesecret");
         let keystore: Arc<dyn Keystore> = Arc::new(InMemoryKeystore::new().expect("keystore"));
         let vault = SecureVault::create(&dir, keystore).expect("create");
         vault
@@ -2301,18 +2294,18 @@ mod tests {
             .expect("store");
 
         vault
-            .update_pat("github_pat_NEW", &descriptor_for("o/r"))
+            .update_secret("nostr_secret_NEW", &descriptor_for("o/r"))
             .expect("update");
 
         let loaded = vault.load_contents().expect("load").expect("present");
-        assert_eq!(loaded.pat, "github_pat_NEW");
+        assert_eq!(loaded.secret, "nostr_secret_NEW");
         assert_eq!(*loaded.group_key, [7u8; GROUP_KEY_LEN], "group key untouched");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn update_pat_rejects_an_empty_token() {
+    fn update_secret_rejects_an_empty_secret() {
         let dir = scratch("updatepatempty");
         let keystore: Arc<dyn Keystore> = Arc::new(InMemoryKeystore::new().expect("keystore"));
         let vault = SecureVault::create(&dir, keystore).expect("create");
@@ -2322,21 +2315,21 @@ mod tests {
 
         assert_eq!(
             vault
-                .update_pat("  ", &descriptor_for("o/r"))
+                .update_secret("  ", &descriptor_for("o/r"))
                 .expect_err("must fail")
                 .kind(),
             AppErrorKind::InvalidArgument
         );
         assert_eq!(
-            vault.load_contents().expect("load").expect("present").pat,
-            "github_pat_TEST"
+            vault.load_contents().expect("load").expect("present").secret,
+            "nostr_secret_TEST"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn update_group_key_keeps_the_pat() {
+    fn update_group_key_keeps_the_secret() {
         let dir = scratch("updatekey");
         let keystore: Arc<dyn Keystore> = Arc::new(InMemoryKeystore::new().expect("keystore"));
         let vault = SecureVault::create(&dir, keystore).expect("create");
@@ -2351,7 +2344,7 @@ mod tests {
             .expect("update");
 
         let loaded = vault.load_contents().expect("load").expect("present");
-        assert_eq!(loaded.pat, "github_pat_TEST", "token untouched");
+        assert_eq!(loaded.secret, "nostr_secret_TEST", "token untouched");
         assert_eq!(*loaded.group_key, [9u8; GROUP_KEY_LEN]);
         assert_eq!(vault.descriptor().expect("descriptor").current_epoch, 1);
 
@@ -2365,7 +2358,7 @@ mod tests {
         let vault = SecureVault::create(&dir, keystore).expect("create");
 
         let err = vault
-            .update_pat("github_pat_NEW", &descriptor_for("o/r"))
+            .update_secret("nostr_secret_NEW", &descriptor_for("o/r"))
             .expect_err("must fail");
         assert_eq!(err.kind(), AppErrorKind::VaultUnavailable);
         assert!(err.to_string().contains("no token to replace"));
@@ -2387,8 +2380,8 @@ mod tests {
             .store_contents(&contents(), &descriptor_for("o/r"))
             .expect("store");
         vault
-            .update_pat("github_pat_REOPENED", &descriptor_for("o/r"))
-            .expect("update pat");
+            .update_secret("nostr_secret_REOPENED", &descriptor_for("o/r"))
+            .expect("update secret");
         vault
             .update_group_key(&[3u8; GROUP_KEY_LEN], &descriptor_for("o/r"))
             .expect("update key");
@@ -2396,7 +2389,7 @@ mod tests {
 
         let reopened = SecureVault::open(&dir, keystore).expect("open");
         let loaded = reopened.load_contents().expect("load").expect("present");
-        assert_eq!(loaded.pat, "github_pat_REOPENED");
+        assert_eq!(loaded.secret, "nostr_secret_REOPENED");
         assert_eq!(*loaded.group_key, [3u8; GROUP_KEY_LEN]);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2513,7 +2506,7 @@ mod tests {
     #[test]
     fn vault_contents_debug_never_prints_secrets() {
         let rendered = format!("{:?}", contents());
-        assert!(!rendered.contains("github_pat_TEST"));
+        assert!(!rendered.contains("nostr_secret_TEST"));
         assert!(rendered.contains("[REDACTED]"));
     }
 
@@ -2521,14 +2514,14 @@ mod tests {
     fn vault_payload_debug_never_prints_secrets() {
         let payload = VaultPayload {
             version: VAULT_FORMAT_VERSION,
-            pat: "github_pat_SECRET".to_string(),
+            secret: "nostr_secret_SECRET".to_string(),
             group_key: [9u8; GROUP_KEY_LEN],
             group: None,
             groups: Vec::new(),
             active_group: None,
         };
         let rendered = format!("{payload:?}");
-        assert!(!rendered.contains("github_pat_SECRET"));
+        assert!(!rendered.contains("nostr_secret_SECRET"));
         assert!(rendered.contains("[REDACTED]"));
     }
 
@@ -2571,11 +2564,11 @@ mod tests {
         for _ in 0..8 {
             let clone = Arc::clone(&vault);
             handles.push(std::thread::spawn(move || {
-                clone.load_contents().expect("load").expect("present").pat
+                clone.load_contents().expect("load").expect("present").secret
             }));
         }
         for handle in handles {
-            assert_eq!(handle.join().expect("thread"), "github_pat_TEST");
+            assert_eq!(handle.join().expect("thread"), "nostr_secret_TEST");
         }
 
         let _ = std::fs::remove_dir_all(&dir);

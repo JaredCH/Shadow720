@@ -3,7 +3,7 @@
 //!
 //! This module owns *policy* — when to poll, when to publish a location, which
 //! key epoch to use, which peers are blocked — and delegates *mechanism* to
-//! [`crate::crypto`], [`crate::geo_filter`], and [`crate::github_db`].
+//! [`crate::crypto`], [`crate::geo_filter`], and [`crate::wire`].
 //!
 //! Nothing here writes to the network directly, which makes the whole decision
 //! surface unit-testable without a sandbox repository.
@@ -26,12 +26,12 @@ use crate::error::{AppError, Result};
 use crate::geo_filter::{
     haversine_m, AdaptiveBackoff, Fix, GeoGate, Jitter, Publish, RateLimitHalt, SkipReason,
 };
-use crate::github_db::{GitHubClient, IssueComment, RepoRef};
+use crate::wire::IssueComment;
 
 /// Poll cadence for the chat channel, from `PLAN_ADDENDUM_v1.md` §A5.
 ///
 /// Nostr relays push over WebSocket and there is no shared request budget, so
-/// the cadence can be tighter than the GitHub path allowed.
+/// the cadence can be tighter than a REST-backed store allowed.
 pub const CHAT_INTERVAL_SECS: u64 = 5;
 /// Poll cadence for the roster channel.
 pub const ROSTER_INTERVAL_SECS: u64 = 15;
@@ -135,7 +135,7 @@ pub fn verifying_key_bytes(key: &VerifyingKey) -> [u8; PUBLIC_KEY_LEN] {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemberView {
-    /// The member's `Issue #1` comment id, i.e. the handle PATCHed on updates.
+    /// The member's roster slot handle, i.e. the value replaced on updates.
     pub comment_id: u64,
     /// Member's Ed25519 public key, Base64.
     pub pubkey_b64: String,
@@ -269,9 +269,8 @@ impl Preferences {
 // ---------------------------------------------------------------------------
 
 /// Everything the app needs to operate in a group, plus the policy state that
-/// decides how often it talks to GitHub.
+/// decides how often it talks to the relays.
 pub struct GroupState {
-    pub repo: RepoRef,
     /// Which storage backend holds this group.
     pub backend: crate::storage::Backend,
     /// Relay URLs, on the Nostr backend.
@@ -283,14 +282,11 @@ pub struct GroupState {
     pub identity: Identity,
     pub keys: RwLock<GroupKeys>,
     pub preferences: RwLock<Preferences>,
-    pub roster_issue_num: u64,
-    pub chat_issue_num: u64,
-    pub release_id: u64,
     pub is_host: bool,
     pub host_pubkey_b64: String,
     pub group_label: String,
 
-    /// This device's own `Issue #1` comment id, once it has joined the roster.
+    /// This device's own roster slot handle, once it has joined the roster.
     pub my_comment_id: RwLock<Option<u64>>,
     /// Movement gate for location publishing.
     pub gate: RwLock<GeoGate>,
@@ -344,11 +340,8 @@ pub const TRAIL_MIN_SPACING_M: f64 = 10.0;
 impl std::fmt::Debug for GroupState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GroupState")
-            .field("repo", &self.repo.full_name())
+            .field("backend", &self.backend.location())
             .field("identity", &self.identity)
-            .field("roster_issue_num", &self.roster_issue_num)
-            .field("chat_issue_num", &self.chat_issue_num)
-            .field("release_id", &self.release_id)
             .field("is_host", &self.is_host)
             .field("group_label", &self.group_label)
             .field("current_epoch", &self.keys.read().current_epoch)
@@ -405,23 +398,7 @@ impl GroupState {
     ) -> Result<Self> {
         invite.validate()?;
 
-        // The Nostr backend has no repository, so the placeholder owner/name are
-        // only used to keep `RepoRef` non-optional for the GitHub path.
-        let repo = if invite.backend == crate::storage::BackendKind::Nostr {
-            RepoRef::new("nostr", invite.group_id.clone())?
-        } else {
-            RepoRef::new(invite.repo_owner.clone(), invite.repo_name.clone())?
-        };
-
         let backend = match invite.backend {
-            crate::storage::BackendKind::GitHub => {
-                crate::storage::Backend::GitHub(crate::storage::GitHubBackend {
-                    repo_full_name: repo.full_name(),
-                    roster_issue_num: invite.roster_issue_num,
-                    chat_issue_num: invite.chat_issue_num,
-                    release_id: invite.release_id,
-                })
-            }
             crate::storage::BackendKind::Nostr => {
                 crate::storage::Backend::Nostr(crate::storage::NostrBackend {
                     group_id: invite.group_id.clone(),
@@ -450,7 +427,6 @@ impl GroupState {
         let jitter = Jitter::from_entropy()?;
 
         Ok(Self {
-            repo,
             backend,
             relays: invite.relays.clone(),
             blossom_servers: invite.blossom_servers.clone(),
@@ -458,9 +434,6 @@ impl GroupState {
             identity,
             keys: RwLock::new(GroupKeys::from_epoch(invite.key_epoch, invite.group_key())),
             preferences: RwLock::new(preferences),
-            roster_issue_num: invite.roster_issue_num,
-            chat_issue_num: invite.chat_issue_num,
-            release_id: invite.release_id,
             is_host,
             host_pubkey_b64,
             group_label: invite.group_label.clone(),
@@ -623,7 +596,7 @@ impl GroupState {
 
     /// Block or mute a member by public key.
     ///
-    /// Blocking is purely local: nothing is sent to GitHub, so the blocked party
+    /// Blocking is purely local: nothing is sent to a relay, so the blocked party
     /// cannot tell they were blocked. Returns `true` when the list changed.
     pub fn block(&self, pubkey_b64: &str) -> bool {
         let mut preferences = self.preferences.write();
@@ -810,7 +783,7 @@ impl GroupState {
             crypto::seal_control(new_key, new_epoch, self.identity.signing_key(), &payload)
         }
 
-        /// Build a key-rotation announcement for Issue #1.
+        /// Build a key-rotation announcement for the roster channel.
         pub fn build_rotation_envelope(
         &self,
         new_epoch: u8,
@@ -923,7 +896,7 @@ impl GroupState {
     /// Turn a decoded [`LocationState`] into a [`MemberView`], applying policy.
     fn member_view(&self, comment_id: u64, sender_pubkey: &str, state: LocationState) -> MemberView {
         let is_self = sender_pubkey == self.identity.pubkey_b64;
-        let age_ms = crate::github_db::now_unix_ms().saturating_sub(state.unix_ms);
+        let age_ms = crate::wire::now_unix_ms().saturating_sub(state.unix_ms);
         let age_s = age_ms / 1_000;
 
         MemberView {
@@ -1002,7 +975,7 @@ impl GroupState {
     /// so the block list can be managed from a settings screen instead of the
     /// member silently vanishing.
     pub fn apply_roster(&self, comments: &[IssueComment]) -> usize {
-        let now_ms = crate::github_db::now_unix_ms();
+        let now_ms = crate::wire::now_unix_ms();
         let mut members = Vec::with_capacity(comments.len());
 
         for comment in comments {
@@ -1050,7 +1023,7 @@ impl GroupState {
     /// * the **track log**, which is the month-long history the map's history view
     ///   reads. It is local-only and never published.
     fn record_trails(&self, members: &[MemberView]) {
-        let now_ms = crate::github_db::now_unix_ms();
+        let now_ms = crate::wire::now_unix_ms();
         let mut trails = self.trails.write();
         let mut history = self.history.write();
         let mut activity = self.activity.write();
@@ -1168,7 +1141,7 @@ impl GroupState {
             }
         }
 
-        // Ascending by comment id preserves GitHub's ordering for equal
+        // Ascending by id preserves the store's ordering for equal
         // timestamps, giving a stable transcript.
         items.sort_by_key(chat_sort_key);
 
@@ -1276,7 +1249,7 @@ impl GroupState {
 
     // -- Cadence ---------------------------------------------------------------
 
-    /// True when GitHub told us to stop, so no channel should poll.
+    /// True when the store told us to stop, so no channel should poll.
     pub fn is_halted(&self, now_unix_s: i64) -> bool {
         self.rate_halt.read().is_halted(now_unix_s)
     }
@@ -1393,10 +1366,6 @@ pub struct CadenceReport {
     pub total_requests: Option<u32>,
 }
 
-/// Convenience: build a client from group state plus a token.
-pub fn client_for(state: &GroupState, pat: &str) -> Result<GitHubClient> {
-    GitHubClient::new(state.repo.clone(), pat)
-}
 
 /// Describe a skip reason for the UI/telemetry layer.
 pub fn describe_skip(reason: SkipReason) -> String {
@@ -1460,18 +1429,11 @@ mod tests {
     fn invite_for(host_pubkey: &str) -> InviteCredentialsPayload {
         InviteCredentialsPayload {
             version: PROTOCOL_VERSION,
-            backend: crate::storage::BackendKind::GitHub,
-            repo_owner: "JaredCH".into(),
-            repo_name: "shadow720-sandbox".into(),
-            repo_scoped_pat: "github_pat_TEST".into(),
+            backend: crate::storage::BackendKind::Nostr,
             group_master_key: TEST_KEY,
-            roster_issue_num: 1,
-            chat_issue_num: 2,
-            release_id: 42,
-            repo_created: true,
-            relays: Vec::new(),
-            blossom_servers: Vec::new(),
-            group_id: String::new(),
+            relays: vec!["wss://relay.example".into()],
+            blossom_servers: vec!["https://blossom.example".into()],
+            group_id: "group-test".into(),
             host_pubkey: host_pubkey.to_string(),
             group_label: "Weekend Trip".into(),
             key_epoch: 0,
@@ -1498,7 +1460,7 @@ mod tests {
     fn trails_record_movement_and_skip_repeats() {
         let state = state();
         let me = identity();
-        let now = crate::github_db::now_unix_ms();
+        let now = crate::wire::now_unix_ms();
 
         // Two fixes at the same spot: only the first should be recorded.
         state.apply_roster(&[roster_comment(&state, &me, Fix::at(1.0, 1.0, now - 20_000), "Me")]);
@@ -1518,7 +1480,7 @@ mod tests {
     fn trails_are_capped() {
         let state = state();
         let me = identity();
-        let now = crate::github_db::now_unix_ms();
+        let now = crate::wire::now_unix_ms();
         for step in 0..(TRAIL_MAX_POINTS + 20) {
             let lat = 1.0 + step as f64 * 0.001;
             state.apply_roster(&[roster_comment(&state, &me, Fix::at(lat, 1.0, now + step as i64), "Me")]);
@@ -1593,7 +1555,7 @@ mod tests {
         assert!(matches!(group.chat.read().first(), Some(ChatItem::File { unavailable: true, .. })));
     }
 
-    /// Build a roster comment as GitHub would return it.
+    /// Build a roster entry as the store would return it.
     fn roster_comment(state: &GroupState, author: &Identity, fix: Fix, name: &str) -> IssueComment {
         let key = state.current_group_key().expect("key");
         let payload = LocationState {
@@ -1725,10 +1687,7 @@ mod tests {
         let me = Identity::generate().expect("generate");
         let state = GroupState::from_invite(&invite_for(&me.pubkey_b64), me, prefs(), true).expect("state");
 
-        assert_eq!(state.repo.full_name(), "JaredCH/shadow720-sandbox");
-        assert_eq!(state.roster_issue_num, 1);
-        assert_eq!(state.chat_issue_num, 2);
-        assert_eq!(state.release_id, 42);
+        assert_eq!(state.group_id, "group-test");
         assert_eq!(state.current_epoch(), 0);
         assert_eq!(state.current_group_key().expect("key"), TEST_KEY);
         assert!(state.is_host);
@@ -1767,17 +1726,16 @@ mod tests {
     fn state_rejects_an_invalid_invite() {
         let me = Identity::generate().expect("generate");
         let mut invite = invite_for(&me.pubkey_b64);
-        invite.release_id = 0;
+        invite.relays.clear();
         let err = GroupState::from_invite(&invite, me, prefs(), true).expect_err("must fail");
         assert_eq!(err.kind(), crate::error::AppErrorKind::InviteFormat);
     }
 
     #[test]
-    fn state_debug_never_prints_the_group_key_or_pat() {
+    fn state_debug_never_prints_the_group_key() {
         let state = state();
         let rendered = format!("{state:?}");
-        assert!(!rendered.contains("github_pat_TEST"));
-        assert!(rendered.contains("JaredCH/shadow720-sandbox"));
+        assert!(rendered.contains("nostr:group-test"));
         assert!(!rendered.contains("070707"), "group key bytes must not appear");
     }
 
@@ -1928,7 +1886,7 @@ mod tests {
     fn history_records_roster_positions() {
         let state = state();
         let me = identity();
-        let now = crate::github_db::now_unix_ms();
+        let now = crate::wire::now_unix_ms();
 
         state.apply_roster(&[roster_comment(&state, &me, Fix::at(1.0, 1.0, now - 20_000), "Me")]);
         state.apply_roster(&[roster_comment(&state, &me, Fix::at(1.01, 1.0, now), "Me")]);
@@ -1941,7 +1899,7 @@ mod tests {
     fn forgetting_history_drops_the_member_and_their_activity() {
         let state = state();
         let me = identity();
-        let now = crate::github_db::now_unix_ms();
+        let now = crate::wire::now_unix_ms();
         state.apply_roster(&[roster_comment(&state, &me, Fix::at(1.0, 1.0, now), "Me")]);
         assert!(!state.history_since(&me.pubkey_b64, 0).is_empty());
 
@@ -2190,7 +2148,7 @@ mod tests {
         let comment = roster_comment(
             &state,
             &me,
-            Fix::at(41.5, -87.5, crate::github_db::now_unix_ms(),),
+            Fix::at(41.5, -87.5, crate::wire::now_unix_ms(),),
             "Jared",
         );
 
@@ -2205,7 +2163,7 @@ mod tests {
     fn decode_member_marks_older_fixes_stale() {
         let state = state();
         let me = Identity::from_secret(*state.identity.secret_bytes());
-        let old_ms = crate::github_db::now_unix_ms() - (MEMBER_STALE_SECS + 60) * 1_000;
+        let old_ms = crate::wire::now_unix_ms() - (MEMBER_STALE_SECS + 60) * 1_000;
 
         let comment = roster_comment(
             &state,
@@ -2224,7 +2182,7 @@ mod tests {
         let comment = roster_comment(
             &state,
             &peer,
-            Fix::at(1.0, 2.0, crate::github_db::now_unix_ms(),),
+            Fix::at(1.0, 2.0, crate::wire::now_unix_ms(),),
             "Peer",
         );
         state.block(&peer.pubkey_b64);
@@ -2365,7 +2323,7 @@ mod tests {
         let me = Identity::from_secret(*state.identity.secret_bytes());
         let peer_a = other_identity(21);
         let peer_b = other_identity(22);
-        let now = crate::github_db::now_unix_ms();
+        let now = crate::wire::now_unix_ms();
 
         let comments = vec![
             roster_comment(&state, &peer_a, Fix::at(1.0, 1.0, now - 100_000), "A"),
@@ -2384,7 +2342,7 @@ mod tests {
     fn apply_roster_drops_expired_entries() {
         let state = state();
         let me = Identity::from_secret(*state.identity.secret_bytes());
-        let ancient = crate::github_db::now_unix_ms() - (MEMBER_EXPIRE_SECS + 600) * 1_000;
+        let ancient = crate::wire::now_unix_ms() - (MEMBER_EXPIRE_SECS + 600) * 1_000;
 
         let comments = vec![roster_comment(
             &state,
@@ -2411,7 +2369,7 @@ mod tests {
             roster_comment(
                 &state,
                 &Identity::from_secret(*state.identity.secret_bytes()),
-                Fix::at(1.0, 1.0, crate::github_db::now_unix_ms(),),
+                Fix::at(1.0, 1.0, crate::wire::now_unix_ms(),),
                 "Valid",
             ),
         ];
@@ -2423,7 +2381,7 @@ mod tests {
     fn apply_roster_replaces_rather_than_appends() {
         let state = state();
         let me = Identity::from_secret(*state.identity.secret_bytes());
-        let now = crate::github_db::now_unix_ms();
+        let now = crate::wire::now_unix_ms();
 
         let one = vec![roster_comment(&state, &me, Fix::at(1.0, 1.0, now), "Me")];
         state.apply_roster(&one);
@@ -2523,7 +2481,7 @@ mod tests {
         fn visible_views_filter_blocked_entries() {
             let state = state();
             let peer = other_identity(51);
-            let now = crate::github_db::now_unix_ms();
+            let now = crate::wire::now_unix_ms();
 
             state.apply_roster(&[
                 roster_comment(&state, &peer, Fix::at(2.0, 2.0, now), "Peer"),
@@ -2558,7 +2516,7 @@ mod tests {
             state.apply_roster(&[roster_comment(
                 &state,
                 &me,
-                Fix::at(1.0, 1.0, crate::github_db::now_unix_ms(),),
+                Fix::at(1.0, 1.0, crate::wire::now_unix_ms(),),
                 "Me",
             )]);
 
@@ -2703,7 +2661,7 @@ mod tests {
         state.apply_roster(&[roster_comment(
             &state,
             &me,
-            Fix::at(1.0, 1.0, crate::github_db::now_unix_ms(),),
+            Fix::at(1.0, 1.0, crate::wire::now_unix_ms(),),
             "Me",
         )]);
 
@@ -2711,19 +2669,6 @@ mod tests {
         assert_eq!(map.get(&state.identity.pubkey_b64), Some(&100));
     }
 
-    #[test]
-    fn client_for_builds_a_client_from_state() {
-        let state = state();
-        let client = client_for(&state, "ghp_test").expect("client");
-        assert_eq!(client.repo().full_name(), "JaredCH/shadow720-sandbox");
-    }
-
-    #[test]
-    fn client_for_rejects_an_empty_token() {
-        let state = state();
-        let err = client_for(&state, "  ").expect_err("must fail");
-        assert_eq!(err.kind(), crate::error::AppErrorKind::NotConfigured);
-    }
 
     #[test]
     fn verifying_key_bytes_matches_the_public_key() {

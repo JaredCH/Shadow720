@@ -24,9 +24,8 @@ import { ConsentGate, InviteDisplay } from "./components/ConsentGate";
 import { ConfirmSheet, ErrorBanner, Field, InfoBanner, Modal, TextArea } from "./components/Modal";
 import { MapPanel } from "./components/MapPanel";
 import { PeopleSheet } from "./components/PeopleSheet";
-import { ProviderPicker, providerById } from "./components/ProviderPicker";
+import { ProviderPicker } from "./components/ProviderPicker";
 import type { ProviderId } from "./components/ProviderPicker";
-import { SignInPanel } from "./components/SignInPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 
 type Phase =
@@ -566,51 +565,6 @@ export default function App() {
     setPhase("needs-group");
   };
 
-  const handleCreateGroup = async (input: {
-    repoOwner: string;
-    repoName: string;
-    repoScopedPat: string;
-    groupLabel: string;
-    joinPassword: string;
-    displayName: string;
-    releaseTag: string;
-    repoCreated: boolean;
-  }) => {
-    const response = await api.createGroup({
-      repoOwner: input.repoOwner,
-      repoName: input.repoName,
-      repoScopedPat: input.repoScopedPat,
-      groupLabel: input.groupLabel,
-      joinPassword: input.joinPassword,
-      displayName: input.displayName,
-      rosterIssueNum: 0,
-      chatIssueNum: 0,
-      releaseTag: input.releaseTag || null,
-      repoCreated: input.repoCreated,
-    });
-
-    setGroupLabel(input.groupLabel);
-    setFingerprint(response.fingerprint);
-    setIsHost(true);
-    setInvite({
-      value: response.invite,
-      fingerprint: response.fingerprint,
-      containsToken: true,
-    });
-    setShowAddGroup(false);
-
-    if (!response.hasAdminScope) {
-      setBanner({
-        kind: "github_auth",
-        message:
-          "The token lacks Administration read/write, so Destroy Group will not work. Everything else is fine.",
-      });
-    }
-
-    await loadGroupState();
-    setPhase("ready");
-  };
-
   const handleCreateNostrGroup = async (input: {
     groupLabel: string;
     joinPassword: string;
@@ -964,7 +918,6 @@ export default function App() {
         <GroupSetup
           banner={banner}
           onDismissBanner={() => setBanner(null)}
-          onCreate={handleCreateGroup}
           onCreateNostr={handleCreateNostrGroup}
           onJoin={handleJoinGroup}
         />
@@ -984,7 +937,7 @@ export default function App() {
                 {groupLabel || "Shadow720"}
               </h1>
               <p className="truncate text-[10px] text-slate-500">
-                {diagnostics?.repoFullName ?? "connected"} · you are{" "}
+                {diagnostics?.groupRef ?? "connected"} · you are{" "}
                 <span className="font-mono">{fingerprint || "—"}</span>
               </p>
             </div>
@@ -1104,11 +1057,6 @@ export default function App() {
                 await loadGroupState();
                 return response.invites;
               }}
-              onRekey={async (newPat, joinPassword) => {
-                const response = await api.rekeyGroup(newPat, joinPassword);
-                await loadGroupState();
-                return response.invites;
-              }}
               onLeave={handleLeave}
               onDestroy={handleDestroy}
               onClose={() => setTab("map")}
@@ -1194,7 +1142,6 @@ export default function App() {
             banner={banner}
             onDismissBanner={() => setBanner(null)}
             onCancel={() => setShowAddGroup(false)}
-            onCreate={handleCreateGroup}
             onCreateNostr={handleCreateNostrGroup}
             onJoin={handleJoinGroup}
           />
@@ -1370,8 +1317,8 @@ function StatusDot({
       }`}
       title={
         remaining === null
-          ? "GitHub request budget unknown"
-          : `${remaining} GitHub requests left this hour`
+          ? "Relay connection status"
+          : `${remaining} relay requests left this hour`
       }
     >
       <span
@@ -1388,16 +1335,6 @@ interface GroupSetupProps {
   banner: AppError | null;
   onDismissBanner: () => void;
   onCancel?: () => void;
-  onCreate: (input: {
-    repoOwner: string;
-    repoName: string;
-    repoScopedPat: string;
-    groupLabel: string;
-    joinPassword: string;
-    displayName: string;
-    releaseTag: string;
-    repoCreated: boolean;
-  }) => Promise<void>;
   onCreateNostr: (input: {
     groupLabel: string;
     joinPassword: string;
@@ -1421,7 +1358,6 @@ function GroupSetup({
   banner,
   onDismissBanner,
   onCancel,
-  onCreate,
   onCreateNostr,
   onJoin,
 }: GroupSetupProps) {
@@ -1436,21 +1372,9 @@ function GroupSetup({
 
   // Create fields.
   const [provider, setProvider] = useState<ProviderId>("nostr");
-  const [provision, setProvision] = useState(true);
-  const [signedIn, setSignedIn] = useState<api.SignInResponse | null>(null);
-  const [allowDestroy, setAllowDestroy] = useState(false);
-  const [repoOwner, setRepoOwner] = useState("");
-  const [repoName, setRepoName] = useState("");
-  const [pat, setPat] = useState("");
   const [label, setLabel] = useState("");
   const [createPassword, setCreatePassword] = useState("");
   const [createName, setCreateName] = useState("");
-  const [releaseTag, setReleaseTag] = useState("vault-v1");
-  /** Set once the repository exists, so the token step can name it. */
-  const [provisioned, setProvisioned] = useState<api.ProvisionResponse | null>(null);
-
-  const selectedProvider = providerById(provider);
-  const repoReady = !provision || provisioned !== null;
 
   const submitJoin = async () => {
     setError(null);
@@ -1468,26 +1392,6 @@ function GroupSetup({
     }
   };
 
-  /** Step one: create the repository so a scoped token can be issued for it. */
-  const submitProvision = async () => {
-    setError(null);
-    setBusy(true);
-    try {
-      // The signed-in token lives in Rust, so nothing secret is passed here.
-      const response = await api.provisionRepository({
-        repoName: repoName.trim() || null,
-        releaseTag: releaseTag.trim() || null,
-      });
-      setProvisioned(response);
-      setRepoOwner(response.repoOwner);
-      setRepoName(response.repoName);
-    } catch (thrown) {
-      setError(api.toAppError(thrown));
-    } finally {
-      setBusy(false);
-    }
-  };
-
   /** Nostr path: no sign-in, no repository, no token. */
   const submitNostr = async () => {
     setError(null);
@@ -1497,31 +1401,6 @@ function GroupSetup({
         groupLabel: label.trim() || "My group",
         joinPassword: createPassword,
         displayName: createName.trim(),
-      });
-    } catch (thrown) {
-      setError(api.toAppError(thrown));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  /** Step two: create the group against the repository that now exists. */
-  const submitCreate = async () => {
-    setError(null);
-    setBusy(true);
-    try {
-      // Only trust the provisioned repo while the provision path is selected;
-      // switching to "use an existing repo" must not silently reuse it.
-      const created = provision ? provisioned : null;
-      await onCreate({
-        repoOwner: created?.repoOwner ?? repoOwner.trim(),
-        repoName: created?.repoName ?? repoName.trim(),
-        repoScopedPat: pat.trim(),
-        groupLabel: label.trim() || "My group",
-        joinPassword: createPassword,
-        displayName: createName.trim(),
-        releaseTag: releaseTag.trim(),
-        repoCreated: created !== null,
       });
     } catch (thrown) {
       setError(api.toAppError(thrown));
@@ -1617,207 +1496,39 @@ function GroupSetup({
           <>
             <ProviderPicker value={provider} onChange={setProvider} />
 
-            {selectedProvider.available ? null : (
-              <InfoBanner
-                tone="warn"
-                message={`${selectedProvider.label} is not available yet. Pick GitHub to create a group now.`}
-              />
-            )}
-
-            {provider === "nostr" ? (
-              <>
-                <InfoBanner message="No account and no setup. A keypair is generated on this device, and the invite carries no credential — each member signs their own events." />
-                <Field
-                  label="Group name"
-                  value={label}
-                  onChange={setLabel}
-                  placeholder="Weekend trip"
-                />
-                <Field
-                  label="Join password"
-                  type="password"
-                  value={createPassword}
-                  onChange={setCreatePassword}
-                  placeholder="Something only your members know"
-                  hint="Protects the invite string. Share it out of band."
-                />
-                <Field
-                  label="Your display name"
-                  value={createName}
-                  onChange={setCreateName}
-                  placeholder="Jared"
-                />
-                <button
-                  type="button"
-                  className="btn-primary w-full"
-                  disabled={
-                    busy ||
-                    createPassword.length === 0 ||
-                    createName.trim().length === 0
-                  }
-                  onClick={() => void submitNostr()}
-                >
-                  {busy ? "Creating…" : "Create group"}
-                </button>
-              </>
-            ) : (
-              <>
-            <div className="flex gap-1 rounded-xl border border-surface-border p-1">
-              {(
-                [
-                  { id: true, label: "Create a new repo" },
-                  { id: false, label: "Use an existing repo" },
-                ] as const
-              ).map((option) => (
-                <button
-                  key={String(option.id)}
-                  type="button"
-                  onClick={() => {
-                    setProvision(option.id);
-                    // A repo provisioned under the other mode must not leak in.
-                    setProvisioned(null);
-                  }}
-                  className={`flex-1 rounded-lg px-3 py-2 text-xs font-semibold ${
-                    provision === option.id
-                      ? "bg-surface-raised text-slate-100"
-                      : "text-slate-500 hover:text-slate-300"
-                  }`}
-                >
-                  {option.label}
-                </button>
-              ))}
-            </div>
-
-            {provision ? (
-              provisioned ? (
-                <InfoBanner
-                  message={`Created ${provisioned.repoFullName} with both schema issues and the vault release. Now create a fine-grained token scoped to just that repository.`}
-                />
-              ) : (
-                <>
-                  <InfoBanner message="Step 1 of 2. Sign in and the app creates the private repository, both schema issues, and the vault release for you. Nothing to set up by hand." />
-                  <SignInPanel
-                    allowDestroy={allowDestroy}
-                    onAllowDestroyChange={setAllowDestroy}
-                    onSignedIn={setSignedIn}
-                  />
-                  {signedIn ? (
-                    <>
-                      <Field
-                        label="Repository name"
-                        value={repoName}
-                        onChange={setRepoName}
-                        placeholder="Leave blank to generate one"
-                        hint="Created private, with an initial commit so the vault release can be tagged."
-                      />
-                      <Field
-                        label="Release tag"
-                        value={releaseTag}
-                        onChange={setReleaseTag}
-                        hint="Created automatically when it does not exist."
-                      />
-                      <button
-                        type="button"
-                        className="btn-primary w-full"
-                        disabled={busy || !selectedProvider.available}
-                        onClick={() => void submitProvision()}
-                      >
-                        {busy ? "Creating repository…" : "Create repository"}
-                      </button>
-                    </>
-                  ) : null}
-                </>
-              )
-            ) : (
-              <>
-                <InfoBanner message="Point the app at a repository you already own. Missing issues and the vault release are created automatically." />
-                <div className="grid grid-cols-2 gap-3">
-                  <Field
-                    label="Repo owner"
-                    value={repoOwner}
-                    onChange={setRepoOwner}
-                    placeholder="JaredCH"
-                  />
-                  <Field
-                    label="Repo name"
-                    value={repoName}
-                    onChange={setRepoName}
-                    placeholder="grp-9f8a7b6c"
-                  />
-                </div>
-                <Field
-                  label="Release tag"
-                  value={releaseTag}
-                  onChange={setReleaseTag}
-                  hint="Created automatically when it does not exist."
-                />
-              </>
-            )}
-
-            {repoReady ? (
-              <>
-                {provision ? (
-                  <InfoBanner message="Step 2 of 2. Name the group and pick a join password. The signed-in account is used automatically." />
-                ) : null}
-
-                <details className="rounded-xl border border-surface-border p-3">
-                  <summary className="cursor-pointer text-xs font-semibold text-slate-400">
-                    Use a repository-scoped token instead (optional, safer)
-                  </summary>
-                  <div className="mt-3">
-                    <Field
-                      label="Repository token"
-                      type="password"
-                      value={pat}
-                      onChange={setPat}
-                      placeholder="github_pat_…"
-                      hint="Leave blank to use the signed-in account. A token scoped to this one repository limits what an invite can do."
-                    />
-                  </div>
-                </details>
-
-                <Field
-                  label="Group name"
-                  value={label}
-                  onChange={setLabel}
-                  placeholder="Weekend trip"
-                />
-
-                <Field
-                  label="Join password"
-                  type="password"
-                  value={createPassword}
-                  onChange={setCreatePassword}
-                  placeholder="Something only your members know"
-                  hint="Protects the invite string. Share it out of band."
-                />
-
-                <Field
-                  label="Your display name"
-                  value={createName}
-                  onChange={setCreateName}
-                  placeholder="Jared"
-                />
-
-                <button
-                  type="button"
-                  className="btn-primary w-full"
-                  disabled={
-                    busy ||
-                    !selectedProvider.available ||
-                    createPassword.length === 0 ||
-                    createName.trim().length === 0 ||
-                    (!provision &&
-                      (repoOwner.trim().length === 0 || repoName.trim().length === 0))
-                  }
-                  onClick={() => void submitCreate()}
-                >
-                  {busy ? "Creating…" : "Create group"}
-                </button>
-              </>
-            ) : null}
-              </>
-            )}
+            <InfoBanner message="No account and no setup. A keypair is generated on this device, and the invite carries no credential — each member signs their own events." />
+            <Field
+              label="Group name"
+              value={label}
+              onChange={setLabel}
+              placeholder="Weekend trip"
+            />
+            <Field
+              label="Join password"
+              type="password"
+              value={createPassword}
+              onChange={setCreatePassword}
+              placeholder="Something only your members know"
+              hint="Protects the invite string. Share it out of band."
+            />
+            <Field
+              label="Your display name"
+              value={createName}
+              onChange={setCreateName}
+              placeholder="Jared"
+            />
+            <button
+              type="button"
+              className="btn-primary w-full"
+              disabled={
+                busy ||
+                createPassword.length === 0 ||
+                createName.trim().length === 0
+              }
+              onClick={() => void submitNostr()}
+            >
+              {busy ? "Creating…" : "Create group"}
+            </button>
           </>
         )}
       </div>

@@ -1,6 +1,7 @@
 //! Nostr-backed implementation of the roster, chat, and blob operations.
 //!
-//! This is the Nostr counterpart to [`crate::github_db::GitHubClient`]. It
+//! This is the Nostr storage engine: relays for the roster, chat, and control
+//! streams, and Blossom servers for blobs. It is the only backend the app ships.
 //! exposes the same *logical* operations — read the roster, read the chat, write
 //! my slot, append a message — so the command layer can pick a backend without
 //! duplicating policy.
@@ -10,7 +11,7 @@
 //! A member's roster entry is an **addressable** event (kind 30000–39999) whose
 //! `d` tag is the group id and whose author is the member's own key. Relays keep
 //! only the newest per `(pubkey, kind, d-tag)`, which gives exactly the "each
-//! member owns one slot" property the GitHub schema got from one comment per
+//! member owns one slot" property the group schema needs: one event per
 //! member. Nobody can overwrite anyone else's slot, because the author is part of
 //! the address.
 //!
@@ -19,7 +20,7 @@
 use std::sync::Arc;
 
 use crate::error::{AppError, Result};
-use crate::github_db::IssueComment;
+use crate::wire::IssueComment;
 use crate::nostr::{
     blossom_auth_header, build_blossom_auth, build_deletion_request, sign_event, BlobRef, Event,
     Filter, NostrIdentity, KIND_CHAT, KIND_DELETE, KIND_FILE, KIND_FILE_LEGACY, KIND_FILE_REMOVED,
@@ -404,7 +405,7 @@ impl NostrStore {
                     return Ok(UploadedBlob { blob, server: server.clone() });
                 }
                 Ok(response) => {
-                    last_error = Some(AppError::GitHubApi {
+                    last_error = Some(AppError::RelayApi {
                         status: response.status().as_u16(),
                         message: format!("{server} rejected the upload"),
                     })
@@ -470,7 +471,7 @@ impl NostrStore {
                     return Ok(bytes.to_vec());
                 }
                 Ok(response) => {
-                    last_error = Some(AppError::GitHubApi {
+                    last_error = Some(AppError::RelayApi {
                         status: response.status().as_u16(),
                         message: format!("{server} does not have that blob"),
                     })

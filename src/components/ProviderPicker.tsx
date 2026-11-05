@@ -1,23 +1,13 @@
 /**
- * Repository-host selector for the create-group flow.
+ * Storage selector for the create-group flow.
  *
- * Providers are grouped by whether they need an account, because that is the
- * decision the user actually cares about: an account provider means signing in
- * or pasting a token, an accountless one means the app can provision everything
- * itself.
- *
- * Only GitHub is wired end to end today. The others are listed with an explicit
- * "not yet" state rather than hidden, so the selector does not silently promise
- * something the backend cannot do.
+ * Nostr is the only backend: identity is a keypair generated on this device, so
+ * there is no account to create and no token to paste. The picker stays as a
+ * single-option list so the create flow keeps its shape and a future backend can
+ * be added without restructuring the form.
  */
 
-export type ProviderId =
-  | "github"
-  | "gitlab"
-  | "codeberg"
-  | "nostr"
-  | "radicle"
-  | "gitgost";
+export type ProviderId = "nostr";
 
 export interface ProviderOption {
   id: ProviderId;
@@ -43,55 +33,6 @@ export const PROVIDER_GROUPS: { title: string; items: ProviderOption[] }[] = [
           "Identity is a keypair generated on this device. No signup, no token, and the invite carries no credential.",
         requiresAccount: false,
         available: true,
-      },
-    ],
-  },
-  {
-    title: "Account backends",
-    items: [
-      {
-        id: "github",
-        label: "GitHub",
-        blurb:
-          "Private repo, issues, and release assets. Sign in and the app builds everything.",
-        requiresAccount: true,
-        available: false,
-        unavailableReason:
-          "The GitHub flow is being reworked. Use Nostr to create a group now.",
-      },
-      {
-        id: "gitlab",
-        label: "GitLab",
-        blurb: "Issues and releases, free tier. Device-flow sign-in supported.",
-        requiresAccount: true,
-        available: false,
-        unavailableReason: "Backend not implemented yet.",
-      },
-      {
-        id: "codeberg",
-        label: "Codeberg",
-        blurb: "Gitea-based, free and non-profit.",
-        requiresAccount: true,
-        available: false,
-        unavailableReason: "Backend not implemented yet.",
-      },
-      {
-        id: "radicle",
-        label: "Radicle",
-        blurb: "Identity is a keypair, no signup. Git only — no issues or releases.",
-        requiresAccount: false,
-        available: false,
-        unavailableReason:
-          "Radicle has no issues or release-asset API, so the roster, chat, and vault have nowhere to live yet.",
-      },
-      {
-        id: "gitgost",
-        label: "gitGost",
-        blurb: "Anonymous gateway to git hosts. No account, no tokens.",
-        requiresAccount: false,
-        available: false,
-        unavailableReason:
-          "Third-party gateway with no issues or release API, and no uptime guarantee to build a group on.",
       },
     ],
   },

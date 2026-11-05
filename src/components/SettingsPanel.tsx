@@ -26,7 +26,6 @@ interface SettingsPanelProps {
   onRefreshVault: () => Promise<void>;
   onDeleteNostrBlob: (sha256: string) => Promise<string>;
   onRotate: (joinPassword: string, removePubkeys: string[]) => Promise<MemberInvite[]>;
-  onRekey: (newPat: string, joinPassword: string) => Promise<MemberInvite[]>;
   onLeave: () => Promise<void>;
   onDestroy: () => Promise<void>;
   onClose: () => void;
@@ -35,7 +34,6 @@ interface SettingsPanelProps {
 type Sheet =
   | { kind: "none" }
   | { kind: "rotate" }
-  | { kind: "rekey" }
   | { kind: "leave" }
   | { kind: "destroy" }
   | { kind: "delete-file"; sha256: string; status: string }
@@ -46,7 +44,7 @@ type Sheet =
  *
  * Split into two halves: things any member can do (block list, storage view,
  * leaving) and host-only operations (rotation, re-keying, destroying). The host
- * controls are hidden for guests because the token would reject them anyway, and
+ * controls are hidden for guests because the group would reject them anyway, and
  * offering a button that always fails is worse than not offering it.
  */
 export function SettingsPanel({
@@ -63,14 +61,12 @@ export function SettingsPanel({
   onRefreshVault,
   onDeleteNostrBlob,
   onRotate,
-  onRekey,
   onLeave,
   onDestroy,
   onClose,
 }: SettingsPanelProps) {
   const [sheet, setSheet] = useState<Sheet>({ kind: "none" });
   const [joinPassword, setJoinPassword] = useState("");
-  const [newPat, setNewPat] = useState("");
   const [removePubkeys, setRemovePubkeys] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<AppError | null>(null);
@@ -91,22 +87,6 @@ export function SettingsPanel({
         invites,
       });
       setNotice("Group key rotated. Hand each member their new invite.");
-    } catch (thrown) {
-      setError(thrown as AppError);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const runRekey = async () => {
-    setError(null);
-    setBusy(true);
-    try {
-      const invites = await onRekey(newPat, joinPassword);
-      setNewPat("");
-      setJoinPassword("");
-      setSheet({ kind: "invites", title: "Invites with the new token", invites });
-      setNotice("Token replaced. The group key is unchanged.");
     } catch (thrown) {
       setError(thrown as AppError);
     } finally {
@@ -184,10 +164,7 @@ export function SettingsPanel({
           </h3>
           {diagnostics ? (
             <dl className="space-y-1 text-xs text-slate-300">
-              <Row
-                label={diagnostics.backend === "nostr" ? "Group" : "Repository"}
-                value={diagnostics.repoFullName}
-              />
+              <Row label="Group" value={diagnostics.groupRef} />
               <Row
                 label="Storage"
                 value={
@@ -211,33 +188,17 @@ export function SettingsPanel({
                 label="Vault"
                 value={
                   vault
-                    ? diagnostics.backend === "nostr"
-                      ? `${formatBytes(vault.totalBytes)} in known uploads; server quota unknown`
-                      : `${formatBytes(vault.totalBytes)} of ${formatBytes(vault.maxBytes)}`
+                    ? `${formatBytes(vault.totalBytes)} in known uploads; server quota unknown`
                     : "loading…"
                 }
               />
-              {diagnostics.accountless ? null : (
-                <Row
-                  label="GitHub budget"
-                  value={
-                    diagnostics.remainingRequests === null
-                      ? "unknown"
-                      : `${diagnostics.remainingRequests}${
-                          diagnostics.totalRequests
-                            ? ` of ${diagnostics.totalRequests}`
-                            : ""
-                        } requests left this hour`
-                  }
-                />
-              )}
               <Row
                 label="Cadence"
                 value={`messages ${diagnostics.chatIntervalS}s · positions ${diagnostics.rosterIntervalS}s`}
               />
               {diagnostics.haltedUntilUnixS ? (
                 <p className="rounded-lg border border-amber-800 bg-amber-950/50 p-2 text-amber-200">
-                  Sync paused until the GitHub rate limit resets. Everything resumes
+              Sync paused until the relay rate limit resets. Everything resumes
                   automatically.
                 </p>
               ) : null}
@@ -387,17 +348,6 @@ export function SettingsPanel({
                   }`
                 : "Rotate group key"}
             </button>
-            <button
-              type="button"
-              className="btn-secondary w-full text-xs"
-              onClick={() => setSheet({ kind: "rekey" })}
-            >
-              Replace GitHub token
-            </button>
-            <p className="text-[10px] text-slate-500">
-              Use this when the token expires. It re-issues invites without changing
-              the key, so nobody is cut off.
-            </p>
           </section>
         ) : null}
 
@@ -447,8 +397,8 @@ export function SettingsPanel({
             Erase
           </h3>
           <p className="text-xs text-slate-400">
-            Leaving deletes your entry from the group and removes every key and token
-            from this device.
+            Leaving deletes your entry from the group and removes every key from
+            this device.
           </p>
           <button
             type="button"
@@ -467,9 +417,8 @@ export function SettingsPanel({
                 Destroy group
               </button>
               <p className="text-[10px] text-slate-500">
-                {diagnostics?.backend === "nostr"
-                  ? "Sends a closure request and wipes this device. Other devices wipe when they receive and verify it; relay copies may remain."
-                  : "Deletes the repository for everyone. Requires a token with Administration read/write."}
+                Sends a closure request and wipes this device. Other devices wipe when
+                they receive and verify it; relay copies may remain.
               </p>
             </>
           ) : null}
@@ -507,38 +456,6 @@ export function SettingsPanel({
         </Modal>
       ) : null}
 
-      {sheet.kind === "rekey" ? (
-        <Modal
-          title="Replace GitHub token"
-          primaryLabel="Verify and re-issue"
-          onPrimary={() => void runRekey()}
-          secondaryLabel="Cancel"
-          onSecondary={() => setSheet({ kind: "none" })}
-          busy={busy || newPat.length === 0 || joinPassword.length === 0}
-        >
-          <p className="text-xs text-slate-400">
-            Generate a new fine-grained token on GitHub with Contents, Issues, and
-            Administration read/write for this repository. The old token keeps working
-            until you revoke it there.
-          </p>
-          <Field
-            label="New token"
-            type="password"
-            value={newPat}
-            onChange={setNewPat}
-            placeholder="github_pat_…"
-            hint="Verified against GitHub before it replaces the stored token."
-          />
-          <Field
-            label="Join password"
-            type="password"
-            value={joinPassword}
-            onChange={setJoinPassword}
-            placeholder="The group's join password"
-          />
-        </Modal>
-      ) : null}
-
       {sheet.kind === "invites" ? (
         <Modal
           title={`${sheet.title} (${sheet.invites.length})`}
@@ -570,7 +487,7 @@ export function SettingsPanel({
             </ul>
           )}
           <p className="text-xs text-amber-300">
-            These strings contain the group's token. Hand each one to its owner over a
+              These strings contain the group key. Hand each one to its owner over a
             channel you trust.
           </p>
         </Modal>
@@ -579,7 +496,7 @@ export function SettingsPanel({
       {sheet.kind === "leave" ? (
         <ConfirmSheet
           title="Leave group and wipe my data?"
-          body="Your position entry is removed for the group, and every key and token is deleted from this device. You will need a fresh invite to rejoin."
+          body="Your position entry is removed for the group, and every key is deleted from this device. You will need a fresh invite to rejoin."
           confirmLabel="Leave and wipe"
           onConfirm={() => void runLeave()}
           onCancel={() => setSheet({ kind: "none" })}
@@ -592,7 +509,7 @@ export function SettingsPanel({
           title="Destroy the group for everyone?"
           body={diagnostics?.backend === "nostr"
             ? "This publishes a host-signed closure and wipes this device. Updated devices that receive it will automatically wipe their group data. Offline devices, relays, and Blossom servers may retain copies."
-            : "The GitHub repository is deleted, taking every message, position, and shared file with it. Every member loses access permanently."}
+                : "The group is closed for everyone, taking every message, position, and shared file with it. Every member loses access permanently."}
           confirmLabel="Destroy group"
           onConfirm={() => void runDestroy()}
           onCancel={() => setSheet({ kind: "none" })}

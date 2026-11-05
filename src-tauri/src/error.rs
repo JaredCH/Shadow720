@@ -24,11 +24,11 @@ pub enum AppErrorKind {
     InviteFormat,
     /// Join password did not unwrap the invite payload (AEAD tag mismatch).
     InvitePassword,
-    /// GitHub REST returned a non-success status.
-    GitHubApi,
-    /// GitHub rejected the request because the token is invalid or expired.
-    GitHubAuth,
-    /// GitHub secondary/primary rate limit reached; caller must back off.
+    /// A relay returned a non-success response.
+    RelayApi,
+    /// A relay rejected the request because the signature or key is invalid.
+    RelayAuth,
+    /// Relay or provider rate limit reached; caller must back off.
     RateLimited,
     /// Network transport failure: DNS, TLS, timeout, connection reset.
     Network,
@@ -44,7 +44,7 @@ pub enum AppErrorKind {
     GroupState,
     /// Local or OS-level I/O failure.
     Io,
-    /// A required integration has not been configured yet (e.g. missing PAT).
+    /// A required integration has not been configured yet (e.g. no relays set).
     NotConfigured,
 }
 
@@ -55,8 +55,8 @@ impl AppErrorKind {
             AppErrorKind::Crypto => "crypto",
             AppErrorKind::InviteFormat => "invite_format",
             AppErrorKind::InvitePassword => "invite_password",
-            AppErrorKind::GitHubApi => "github_api",
-            AppErrorKind::GitHubAuth => "github_auth",
+            AppErrorKind::RelayApi => "relay_api",
+            AppErrorKind::RelayAuth => "relay_auth",
             AppErrorKind::RateLimited => "rate_limited",
             AppErrorKind::Network => "network",
             AppErrorKind::ResponseParse => "response_parse",
@@ -73,7 +73,7 @@ impl AppErrorKind {
 /// The application error type.
 ///
 /// `#[error(...)]` strings become the user-facing message. Variants deliberately
-/// avoid interpolating secrets: `repo_scoped_pat` must never end up in a log or
+/// avoid interpolating secrets: a signing secret must never end up in a log or
 /// an error surfaced to the UI.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -86,13 +86,13 @@ pub enum AppError {
     #[error("join password is incorrect")]
     InvitePassword,
 
-    #[error("GitHub API error {status}: {message}")]
-    GitHubApi { status: u16, message: String },
+    #[error("relay error {status}: {message}")]
+    RelayApi { status: u16, message: String },
 
-    #[error("GitHub authentication failed (HTTP {status}); the token may be expired or under-scoped")]
-    GitHubAuth { status: u16 },
+    #[error("relay rejected the request (HTTP {status}); the event signature or key may be invalid")]
+    RelayAuth { status: u16 },
 
-    #[error("GitHub rate limit reached; retry after {reset_unix_s} (unix seconds)")]
+    #[error("rate limit reached; retry after {reset_unix_s} (unix seconds)")]
     RateLimited { reset_unix_s: i64, remaining: u32 },
 
     #[error("network request to {url} failed: {source_message}")]
@@ -101,7 +101,7 @@ pub enum AppError {
         source_message: String,
     },
 
-    #[error("could not parse GitHub response for {endpoint}: {reason}")]
+    #[error("could not parse the response for {endpoint}: {reason}")]
     ResponseParse { endpoint: String, reason: String },
 
     #[error("{what} is {actual_bytes} bytes, which exceeds the {limit_bytes} byte limit")]
@@ -137,8 +137,8 @@ impl AppError {
             AppError::Crypto(_) => AppErrorKind::Crypto,
             AppError::InviteFormat(_) => AppErrorKind::InviteFormat,
             AppError::InvitePassword => AppErrorKind::InvitePassword,
-            AppError::GitHubApi { .. } => AppErrorKind::GitHubApi,
-            AppError::GitHubAuth { .. } => AppErrorKind::GitHubAuth,
+            AppError::RelayApi { .. } => AppErrorKind::RelayApi,
+            AppError::RelayAuth { .. } => AppErrorKind::RelayAuth,
             AppError::RateLimited { .. } => AppErrorKind::RateLimited,
             AppError::Network { .. } => AppErrorKind::Network,
             AppError::ResponseParse { .. } => AppErrorKind::ResponseParse,
@@ -166,7 +166,7 @@ impl AppError {
             self,
             AppError::InvitePassword
                 | AppError::InviteFormat(_)
-                | AppError::GitHubAuth { .. }
+                | AppError::RelayAuth { .. }
                 | AppError::VaultUnavailable(_)
                 | AppError::NotConfigured(_)
                 | AppError::InvalidArgument(_)
@@ -256,13 +256,13 @@ mod tests {
             (AppError::InviteFormat("x".into()), AppErrorKind::InviteFormat),
             (AppError::InvitePassword, AppErrorKind::InvitePassword),
             (
-                AppError::GitHubApi {
+                AppError::RelayApi {
                     status: 404,
                     message: "nope".into(),
                 },
-                AppErrorKind::GitHubApi,
+                AppErrorKind::RelayApi,
             ),
-            (AppError::GitHubAuth { status: 401 }, AppErrorKind::GitHubAuth),
+            (AppError::RelayAuth { status: 401 }, AppErrorKind::RelayAuth),
             (
                 AppError::RateLimited {
                     reset_unix_s: 0,
@@ -348,8 +348,8 @@ mod tests {
         assert!(!AppError::Crypto("x".into()).is_retryable());
 
         assert!(AppError::InvitePassword.is_user_actionable());
-        assert!(AppError::GitHubAuth { status: 401 }.is_user_actionable());
-        assert!(!AppError::GitHubApi {
+        assert!(AppError::RelayAuth { status: 401 }.is_user_actionable());
+        assert!(!AppError::RelayApi {
             status: 500,
             message: "oops".into()
         }
@@ -366,10 +366,10 @@ mod tests {
 
     #[test]
     fn errors_never_contain_secrets_in_message() {
-        // Guards the contract that tokens are not interpolated into messages.
-        let err = AppError::GitHubAuth { status: 401 };
+        // Guards the contract that key material is not interpolated into messages.
+        let err = AppError::RelayAuth { status: 401 };
         let rendered = err.to_string();
-        assert!(!rendered.contains("ghp_"));
-        assert!(!rendered.contains("github_pat_"));
+        assert!(!rendered.contains("nsec1"));
+        assert!(!rendered.contains("nostr_secret_"));
     }
 }

@@ -1,9 +1,9 @@
 //! Shadow720 — serverless E2EE group app.
 //!
-//! Rust core for a Tauri v2 Android client that uses a private GitHub repository
-//! as an untrusted ciphertext store. There is no application server: the device
-//! talks to the GitHub REST v3 API directly, and every payload is sealed locally
-//! with `XChaCha20-Poly1305` and signed with `Ed25519` before it leaves the app.
+//! Rust core for a Tauri v2 Android client that uses public Nostr relays as an
+//! untrusted ciphertext store. There is no application server and no account: the
+//! device talks to relays directly, and every payload is sealed locally with
+//! `XChaCha20-Poly1305` and signed with `Ed25519` before it leaves the app.
 //!
 //! # Module layout
 //!
@@ -12,8 +12,11 @@
 //! | [`error`] | Single `AppError` type, panic-free fallible operations |
 //! | [`crypto`] | Key material, invite tokens, envelope seal/open, key epochs |
 //! | [`geo_filter`] | Movement gating, polling cadence, jitter, rate-limit halting |
-//! | [`github_db`] | GitHub REST storage engine: comments, release assets, pruning |
-//! | [`vault`] | Stronghold + Keystore-backed secret storage at rest |
+//! | [`nostr`] | Event signing, verification, and filter construction |
+//! | [`nostr_relay`] | Relay websocket transport |
+//! | [`nostr_store`] | Relay and Blossom storage engine |
+//! | [`wire`] | Backend-neutral wire types shared with the command layer |
+//! | [`vault`] | Keystore-backed secret storage at rest |
 //! | [`group`] | In-memory aggregate: group keys, roster, cadence budget |
 //! | [`commands`] | `#[tauri::command]` surface for the TypeScript UI |
 //! # Panic freedom
@@ -39,15 +42,14 @@ pub mod commands;
 pub mod crypto;
 pub mod error;
 pub mod geo_filter;
-pub mod github_db;
 pub mod group;
 pub mod history;
 pub mod nostr;
 pub mod nostr_relay;
 pub mod nostr_store;
-pub mod oauth;
 pub mod storage;
 pub mod vault;
+pub mod wire;
 
 #[cfg(target_os = "android")]
 pub mod keystore_android;
@@ -167,15 +169,11 @@ pub fn run() {
             commands::lock_vault,
             commands::consent_status,
             commands::set_preferences,
-                        commands::set_background_location,
+            commands::set_background_location,
             commands::location_access,
             commands::battery_status,
             commands::open_location_settings,
-            commands::begin_sign_in,
-            commands::poll_sign_in,
-            commands::provision_repository,
             commands::create_nostr_group,
-            commands::create_group,
             commands::join_group,
             commands::update_location,
             commands::poll_roster,
@@ -199,7 +197,6 @@ pub fn run() {
             commands::share_invite,
             commands::set_member_role,
             commands::rotate_group_key,
-            commands::rekey_group,
             commands::leave_and_wipe,
             commands::destroy_group,
             commands::check_group_closed,

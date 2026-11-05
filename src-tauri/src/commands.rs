@@ -5,7 +5,7 @@
 //! * Every command returns [`crate::error::Result`], so the TS side receives
 //!   `{ kind, message }` on failure and can branch on `kind` instead of parsing
 //!   prose.
-//! * No command takes a PAT as an argument: the token lives in the vault and is
+//! * No command takes a signing secret as an argument: it lives in the vault and is
 //!   only ever read from there, so it cannot be echoed through the webview by
 //!   accident.
 //! * Commands that mutate group state persist to the vault before reporting
@@ -19,27 +19,15 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tauri::State;
-use zeroize::Zeroizing;
 
 use crate::crypto::{self, InviteCredentialsPayload, PROTOCOL_VERSION};
 use crate::error::{AppError, Result};
 use crate::geo_filter::{Fix, Publish};
-use crate::github_db::{now_unix_ms, GitHubClient, IssueComment, ProvisioningClient, RepoRef};
-use crate::oauth;
 use crate::group::{
     self, ChatItem, GroupState, Identity, MemberView, Preferences, RotationNotice, SharedGroup,
 };
 use crate::vault::{SecureVault, StoredGroup, StoredUpload, VaultContents, VaultDescriptor, DESCRIPTOR_VERSION};
-
-/// Release tag used for the vault when the caller does not name one.
-const DEFAULT_RELEASE_TAG: &str = "vault-v1";
-
-/// Public OAuth client id for the device flow.
-///
-/// Device-flow client ids are not secrets: the grant is designed for public
-/// clients, so this is safe to compile in. Replace it with the id of the app
-/// registered under the project's GitHub account before shipping.
-const DEFAULT_OAUTH_CLIENT_ID: &str = "Ov23liShadow720DeviceFlow";
+use crate::wire::{now_unix_ms, IssueComment};
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -51,16 +39,6 @@ pub struct AppState {
     pub vault: parking_lot::RwLock<Option<Arc<SecureVault>>>,
     /// The active group, or `None` before join/create.
     pub group: SharedGroup,
-    /// Token from a completed sign-in, held only until the group is created.
-    ///
-    /// Kept in Rust rather than handed to the webview so an account-scoped token
-    /// never crosses the JS boundary. Cleared as soon as it is consumed.
-    pub pending_account_token: parking_lot::RwLock<Option<Zeroizing<String>>>,
-    /// Opaque device code for the sign-in in progress.
-    ///
-    /// Also kept in Rust: the UI only ever sees the short `user_code` the human
-    /// types, never the polling secret.
-    pub pending_device_code: parking_lot::RwLock<Option<Zeroizing<String>>>,
     file_deletion_lock: tokio::sync::Mutex<()>,
 }
 
@@ -79,15 +57,8 @@ impl AppState {
         Self {
             vault: parking_lot::RwLock::new(None),
             group: Arc::new(parking_lot::RwLock::new(None)),
-            pending_account_token: parking_lot::RwLock::new(None),
-            pending_device_code: parking_lot::RwLock::new(None),
             file_deletion_lock: tokio::sync::Mutex::new(()),
         }
-    }
-
-    /// Take the signed-in account token, clearing it so it is used at most once.
-    fn take_account_token(&self) -> Option<Zeroizing<String>> {
-        self.pending_account_token.write().take()
     }
 
     /// Borrow the vault or explain that it must be unlocked first.
@@ -102,34 +73,19 @@ impl AppState {
         group::require_group(&self.group)
     }
 
-    /// Read the PAT out of the vault.
-    fn pat(&self) -> Result<String> {
+    /// Read the group signing secret out of the vault.
+    fn secret(&self) -> Result<String> {
         let vault = self.vault()?;
         let contents = vault
             .load_contents()?
             .ok_or_else(|| AppError::NotConfigured("no group credentials are stored yet".into()))?;
-        Ok(contents.pat)
-    }
-
-    /// Build a GitHub client for the active group.
-    fn client(&self) -> Result<GitHubClient> {
-        let group_state = self.group()?;
-        let pat = self.pat()?;
-        GitHubClient::new(group_state.repo.clone(), pat)
+        Ok(contents.secret)
     }
 
     /// Build a Nostr store for the active group.
-    ///
-    /// The vault holds the Nostr secret in the same slot the PAT occupies, so
-    /// switching backends does not need a second storage path.
     fn nostr_store(&self) -> Result<crate::nostr_store::NostrStore> {
         let group_state = self.group()?;
-        if group_state.backend.kind() != crate::storage::BackendKind::Nostr {
-            return Err(AppError::group_state(
-                "this group is stored on GitHub, not Nostr",
-            ));
-        }
-        let secret = self.pat()?;
+        let secret = self.secret()?;
         let identity = crate::nostr::NostrIdentity::from_hex(&secret)?;
         crate::nostr_store::store_for(
             &group_state.group_id,
@@ -139,15 +95,11 @@ impl AppState {
         )
     }
 
-    /// True when the active group is stored on Nostr.
-    fn is_nostr(&self) -> Result<bool> {
-        Ok(self.group()?.backend.kind() == crate::storage::BackendKind::Nostr)
-    }
-
-        /// Borrow the PAT, inserting it into the group state so invite re-issue can
-        /// embed it. Reads from the vault only; never from a command argument.
-        fn pat_for_invites(&self) -> Result<String> {
-            self.pat()
+        /// Borrow the signing secret so invite re-issue can embed it. Reads from
+        /// the vault only; never from a command argument.
+        #[allow(dead_code)]
+        fn secret_for_invites(&self) -> Result<String> {
+            self.secret()
         }
     }
 
@@ -180,65 +132,11 @@ pub struct UnlockResponse {
     pub existed: bool,
     /// True when a group is already configured in this vault.
     pub group_configured: bool,
-    /// Repo the stored credentials belong to, when configured.
-    pub repo_full_name: Option<String>,
+    /// Group reference the stored credentials belong to, when configured.
+    pub group_ref: Option<String>,
     /// Current key epoch, when configured.
     pub current_epoch: Option<u8>,
     pub requires_recovery: bool,
-}
-
-/// Request to create a group as the host.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateGroupRequest {
-    /// Owner of the repository. Provisioned repos report this back to the UI.
-    #[serde(default)]
-    pub repo_owner: Option<String>,
-    /// Repository name.
-    #[serde(default)]
-    pub repo_name: Option<String>,
-    /// Repository token. When empty, the signed-in account token is used instead,
-    /// which removes the last manual setup step at the cost of embedding an
-    /// account-scoped token in the invite.
-    #[serde(default)]
-    pub repo_scoped_pat: String,
-    pub group_label: String,
-    /// Password guests will need to unwrap the invite.
-    pub join_password: String,
-    pub display_name: String,
-    /// Issue number holding the roster. `0` creates one and uses its number.
-    #[serde(default)]
-    pub roster_issue_num: u64,
-    /// Issue number holding the chat. `0` creates one and uses its number.
-    #[serde(default)]
-    pub chat_issue_num: u64,
-    /// Release id whose assets form the vault. Use 0 to look it up by tag.
-    #[serde(default)]
-    pub release_id: u64,
-    /// Tag to resolve when `release_id` is 0.
-    #[serde(default)]
-    pub release_tag: Option<String>,
-    /// True when [`provision_repository`] created this repository.
-    #[serde(default)]
-    pub repo_created: bool,
-}
-
-/// Result of creating a group.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateGroupResponse {
-    /// The invite string to hand to guests.
-    pub invite: String,
-    /// This device's key fingerprint, for verbal identification.
-    pub fingerprint: String,
-    /// Resolved repo, after validation.
-    pub repo_full_name: String,
-    /// Authenticated login the token belongs to.
-    pub token_login: String,
-    /// True when the token carries `Administration: Read/Write`.
-    pub has_admin_scope: bool,
-    /// Resolved vault release id.
-    pub release_id: u64,
 }
 
 /// Request to join as a guest.
@@ -254,14 +152,11 @@ pub struct JoinGroupRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JoinGroupResponse {
-    pub repo_full_name: String,
+    pub group_ref: String,
     pub group_label: String,
-    pub roster_issue_num: u64,
-    pub chat_issue_num: u64,
-    pub release_id: u64,
     pub key_epoch: u8,
     pub fingerprint: String,
-    /// True when this device already had a roster comment, i.e. a re-join.
+    /// True when this device already had a roster entry, i.e. a re-join.
     pub already_member: bool,
 }
 
@@ -713,30 +608,6 @@ pub struct SetRoleRequest {
     pub role: String,
 }
 
-/// Request to re-key the group with a replacement token.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RekeyRequest {
-    pub new_pat: String,
-    pub join_password: String,
-    /// Release tag to resolve, creating the release when it is missing.
-    #[serde(default)]
-    pub release_tag: Option<String>,
-}
-
-/// Result of a re-key.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RekeyResponse {
-    /// True when the new token authenticated successfully.
-    pub token_valid: bool,
-    /// Authenticated login the new token belongs to.
-    pub token_login: String,
-    pub invites: Vec<MemberInvite>,
-    /// Key epoch, unchanged by a re-key.
-    pub key_epoch: u8,
-}
-
 /// Result of leaving and wiping.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -751,7 +622,7 @@ pub struct WipeResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DestroyResponse {
-    pub repo_full_name: String,
+    pub group_ref: String,
     pub vault_wiped: bool,
     pub accepted_relays: Vec<String>,
     pub unconfirmed_relays: Vec<String>,
@@ -761,7 +632,7 @@ pub struct DestroyResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiagnosticsResponse {
-    pub repo_full_name: String,
+    pub group_ref: String,
     pub group_label: String,
     /// Which storage backend holds this group.
     pub backend: String,
@@ -810,7 +681,7 @@ pub struct VaultReport {
     pub assets: Vec<VaultAssetView>,
     pub total_bytes: u64,
     pub max_bytes: u64,
-    /// Requests remaining this hour, if GitHub reported it.
+    /// Requests remaining this hour, when the backend reports a budget.
     pub rate_limit_remaining: Option<u32>,
 }
 
@@ -839,9 +710,6 @@ pub async fn unlock_vault(
         let contents = vault.load_contents()?.ok_or_else(|| AppError::vault("group credentials are missing"))?;
         stored.invite.group_master_key = *contents.group_key;
         stored.invite.key_epoch = descriptor.current_epoch;
-        if stored.invite.backend == crate::storage::BackendKind::GitHub {
-            stored.invite.repo_scoped_pat = contents.pat;
-        }
         let identity = Identity::from_secret(stored.identity_secret);
         let group_state = GroupState::from_invite(&stored.invite, identity, stored.preferences.clone(), stored.is_host)?;
         group_state.install_roles(&stored.roles.iter().map(|role| (role.pubkey_b64.clone(), role.role.clone())).collect::<Vec<_>>());
@@ -862,7 +730,7 @@ pub async fn unlock_vault(
     Ok(UnlockResponse {
         existed,
         group_configured: configured,
-        repo_full_name: descriptor.as_ref().map(|d| d.repo_full_name.clone()),
+        group_ref: descriptor.as_ref().map(|d| d.group_ref.clone()),
         current_epoch: descriptor.as_ref().map(|d| d.current_epoch),
         requires_recovery,
     })
@@ -948,9 +816,6 @@ pub fn switch_group(state: State<'_, AppState>, group_id: String) -> Result<()> 
     })?;
     stored.invite.group_master_key = *contents.group_key;
     stored.invite.key_epoch = descriptor.current_epoch;
-    if stored.invite.backend == crate::storage::BackendKind::GitHub {
-        stored.invite.repo_scoped_pat = contents.pat;
-    }
     let identity = Identity::from_secret(stored.identity_secret);
     let group_state = GroupState::from_invite(
         &stored.invite,
@@ -1069,216 +934,6 @@ pub fn set_preferences(
 // Create and join
 // ---------------------------------------------------------------------------
 
-/// Request to start an account sign-in.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BeginSignInRequest {
-    /// Include the destructive `delete_repo` scope so "Destroy Group" works.
-    #[serde(default)]
-    pub allow_destroy: bool,
-}
-
-/// A pending sign-in, ready to show the user.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BeginSignInResponse {
-    /// Short code the user types at `verificationUri`.
-    pub user_code: String,
-    /// Page the user should open.
-    pub verification_uri: String,
-    /// Seconds until the code expires.
-    pub expires_in: u64,
-    /// Minimum seconds between polls.
-    pub interval: u64,
-}
-
-/// Result of a completed sign-in.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SignInResponse {
-    /// Authenticated login.
-    pub login: String,
-    /// Scopes GitHub actually granted.
-    pub scope: String,
-    /// True when `delete_repo` was granted, so Destroy Group will work.
-    pub can_destroy: bool,
-}
-
-/// Request to create a repository and its schema, before any token exists.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProvisionRequest {
-    /// Account-scoped token, for callers that paste one instead of signing in.
-    ///
-    /// Optional: when a sign-in has already completed, the token is taken from
-    /// app state and this is ignored.
-    #[serde(default)]
-    pub account_token: Option<String>,
-    /// Repository name. Generated when empty.
-    #[serde(default)]
-    pub repo_name: Option<String>,
-    /// Release tag for the vault. Defaults to `vault-v1`.
-    #[serde(default)]
-    pub release_tag: Option<String>,
-}
-
-/// Result of provisioning, before the group itself exists.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProvisionResponse {
-    pub repo_owner: String,
-    pub repo_name: String,
-    pub repo_full_name: String,
-    pub roster_issue_num: u64,
-    pub chat_issue_num: u64,
-    pub release_id: u64,
-    /// Authenticated login the account token belongs to.
-    pub account_login: String,
-}
-
-// ---------------------------------------------------------------------------
-// Account sign-in (OAuth device flow)
-// ---------------------------------------------------------------------------
-
-/// Start an account sign-in and return the code to show the user.
-///
-/// This is the whole point of the device flow: the user presses one button, sees
-/// a short code, approves on whatever device they already have, and never has to
-/// create a token by hand. Fine-grained PATs cannot be minted through the API, so
-/// this is the only way to keep setup inside the app.
-#[tauri::command]
-pub async fn begin_sign_in(
-    state: State<'_, AppState>,
-    request: BeginSignInRequest,
-) -> Result<BeginSignInResponse> {
-    let client = oauth::DeviceFlowClient::new(oauth_client_id()?)?;
-    let scopes = oauth::scopes_for_group(request.allow_destroy);
-    let code = client.request_device_code(&scopes).await?;
-
-    // Keep the polling secret in Rust; the UI only needs the human-typed code.
-    *state.pending_device_code.write() = Some(Zeroizing::new(code.device_code.clone()));
-
-    Ok(BeginSignInResponse {
-        user_code: code.user_code.clone(),
-        verification_uri: code.verification_uri.clone(),
-        expires_in: code.expires_in,
-        interval: code.interval,
-    })
-}
-
-/// Poll once for a completed sign-in.
-///
-/// Returns `None` while the user has not approved yet, so the UI can keep a
-/// spinner running without treating "not yet" as an error.
-#[tauri::command]
-pub async fn poll_sign_in(state: State<'_, AppState>) -> Result<Option<SignInResponse>> {
-    let device_code = state
-        .pending_device_code
-        .read()
-        .clone()
-        .ok_or_else(|| AppError::not_configured("no sign-in is in progress"))?;
-
-    let client = oauth::DeviceFlowClient::new(oauth_client_id()?)?;
-    match client.poll_once(device_code.as_str()).await? {
-        Ok(token) => {
-            let login = ProvisioningClient::new(token.access_token.to_string())?
-                .validate_token()
-                .await?;
-            let can_destroy = token
-                .scope
-                .split([',', ' '])
-                .any(|s| s == oauth::SCOPE_DESTROY);
-            let scope = token.scope.clone();
-            // Hold the token in Rust; the webview only ever sees the login.
-            *state.pending_account_token.write() = Some(token.access_token);
-            // The device code is single-use; drop it so a stale poll cannot retry.
-            *state.pending_device_code.write() = None;
-            Ok(Some(SignInResponse {
-                login,
-                scope,
-                can_destroy,
-            }))
-        }
-        Err(_pending) => Ok(None),
-    }
-}
-
-/// Read the embedded OAuth client id.
-///
-/// A device-flow client id is public by design, so it is compiled in rather than
-/// configured. It can still be overridden for a fork or a test build.
-fn oauth_client_id() -> Result<String> {
-    let id = std::env::var("SHADOW720_OAUTH_CLIENT_ID")
-        .ok()
-        .filter(|id| !id.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_OAUTH_CLIENT_ID.to_string());
-    if id.trim().is_empty() {
-        return Err(AppError::not_configured(
-            "no OAuth client id is compiled in, so account sign-in is unavailable",
-        ));
-    }
-    Ok(id)
-}
-
-/// Create the repository, both schema issues, and the vault release.
-///
-/// Split out from [`create_group`] because a fine-grained token cannot be scoped
-/// to a repository that does not exist yet: the UI provisions first, then asks
-/// for a token scoped to the repository it just created.
-#[tauri::command]
-pub async fn provision_repository(
-    state: State<'_, AppState>,
-    request: ProvisionRequest,
-) -> Result<ProvisionResponse> {
-    // Prefer the signed-in token; fall back to a pasted one for headless use.
-    let signed_in = state.take_account_token();
-    let account_token: Zeroizing<String> = match signed_in {
-        Some(token) => token,
-        None => Zeroizing::new(
-            request
-                .account_token
-                .as_deref()
-                .unwrap_or("")
-                .trim()
-                .to_string(),
-        ),
-    };
-    if account_token.trim().is_empty() {
-        return Err(AppError::not_configured(
-            "sign in to an account first; creating a repository needs an account token",
-        ));
-    }
-
-    let release_tag = request
-        .release_tag
-        .as_deref()
-        .map(str::trim)
-        .filter(|tag| !tag.is_empty())
-        .unwrap_or(DEFAULT_RELEASE_TAG);
-
-    let name = request
-        .repo_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(generate_repo_name);
-
-    let provisioner = ProvisioningClient::new(account_token.as_str())?;
-    let account_login = provisioner.validate_token().await?;
-    let provisioned = provisioner.provision(&name, release_tag).await?;
-
-    Ok(ProvisionResponse {
-        repo_owner: provisioned.repo.owner.clone(),
-        repo_name: provisioned.repo.name.clone(),
-        repo_full_name: provisioned.repo.full_name(),
-        roster_issue_num: provisioned.roster_issue_num,
-        chat_issue_num: provisioned.chat_issue_num,
-        release_id: provisioned.release_id,
-        account_login,
-    })
-}
-
 /// Request to create a group on the accountless Nostr backend.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1356,18 +1011,10 @@ pub async fn create_nostr_group(
     let invite_payload = InviteCredentialsPayload {
         version: PROTOCOL_VERSION,
         backend: crate::storage::BackendKind::Nostr,
-        repo_owner: String::new(),
-        repo_name: String::new(),
-        // No shared credential: this is the whole point of the Nostr backend.
-        repo_scoped_pat: String::new(),
+        group_id: group_id.clone(),
         group_master_key: *group_key,
-        roster_issue_num: 0,
-        chat_issue_num: 0,
-        release_id: 0,
-        repo_created: true,
         relays: relays.clone(),
         blossom_servers: blossom_servers.clone(),
-        group_id: group_id.clone(),
         host_pubkey: identity.pubkey_b64.clone(),
         group_label: request.group_label.clone(),
         key_epoch: 0,
@@ -1387,13 +1034,13 @@ pub async fn create_nostr_group(
     let descriptor = VaultDescriptor {
         version: DESCRIPTOR_VERSION,
         keystore_alias: vault.keystore_alias(),
-        repo_full_name: format!("nostr:{group_id}"),
+        group_ref: format!("nostr:{group_id}"),
         current_epoch: 0,
     };
     vault.store_group_contents(
         &VaultContents {
-            // The Nostr secret is the group credential; it replaces the PAT.
-            pat: nostr_identity.secret_hex().to_string(),
+            // The Nostr signing secret is the group credential.
+            secret: nostr_identity.secret_hex().to_string(),
             group_key: zeroize::Zeroizing::new(*group_key),
         },
         &descriptor,
@@ -1421,139 +1068,6 @@ pub async fn create_nostr_group(
     })
 }
 
-/// Create a group as the host.
-#[tauri::command]
-pub async fn create_group(
-    state: State<'_, AppState>,
-    request: CreateGroupRequest,
-) -> Result<CreateGroupResponse> {
-    let vault = state.vault()?;
-    if request.join_password.is_empty() {
-        return Err(AppError::invalid_argument(
-            "a join password is required; it is what protects the invite string",
-        ));
-    }
-
-    let release_tag = request
-        .release_tag
-        .clone()
-        .filter(|tag| !tag.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_RELEASE_TAG.to_string());
-
-    let owner = request.repo_owner.as_deref().unwrap_or("").trim();
-    let name = request.repo_name.as_deref().unwrap_or("").trim();
-    if owner.is_empty() || name.is_empty() {
-        return Err(AppError::invalid_argument(
-            "a repository owner and name are required; provision one first if it does not exist",
-        ));
-    }
-
-    let repo = RepoRef::new(owner, name)?;
-
-    // Prefer an explicit repository token; fall back to the signed-in account
-    // token so the user never has to create one by hand.
-    let group_token: Zeroizing<String> = if request.repo_scoped_pat.trim().is_empty() {
-        state.take_account_token().ok_or_else(|| {
-            AppError::not_configured(
-                "sign in to an account, or paste a repository token, before creating a group",
-            )
-        })?
-    } else {
-        Zeroizing::new(request.repo_scoped_pat.trim().to_string())
-    };
-
-    let client = GitHubClient::new(repo.clone(), group_token.as_str())?;
-
-    // Fail before writing anything if the token cannot reach the repository.
-    let token_login = client.validate_token().await?;
-    let _is_private = client.repo_is_accessible().await?;
-
-    // Repair pass: create any missing schema piece rather than telling the host
-    // to go and do it by hand. A provisioned repo already has all of it, so this
-    // is a no-op there and a fix-up on the adopt path.
-    let (roster_issue_num, chat_issue_num) = client
-        .ensure_schema_issues(request.roster_issue_num, request.chat_issue_num)
-        .await?;
-    let release_id = if request.release_id != 0 {
-        request.release_id
-    } else {
-        client.ensure_release(&release_tag).await?
-    };
-
-    let has_admin_scope = client.has_admin_scope().await.unwrap_or(false);
-
-    let identity = Identity::generate()?;
-    let group_key = crypto::new_group_key()?;
-
-    let invite_payload = InviteCredentialsPayload {
-        version: PROTOCOL_VERSION,
-        backend: crate::storage::BackendKind::GitHub,
-        repo_owner: repo.owner.clone(),
-        repo_name: repo.name.clone(),
-        repo_scoped_pat: group_token.to_string(),
-        group_master_key: *group_key,
-        roster_issue_num,
-        chat_issue_num,
-        release_id,
-        repo_created: request.repo_created,
-        relays: Vec::new(),
-        blossom_servers: Vec::new(),
-        group_id: String::new(),
-        host_pubkey: identity.pubkey_b64.clone(),
-        group_label: request.group_label.clone(),
-        key_epoch: 0,
-    };
-
-    let invite = crypto::pack_invite(&invite_payload, &request.join_password)?;
-
-    // Persist credentials before building in-memory state, so a failure here
-    // cannot leave a group the user cannot re-open.
-    let preferences = Preferences {
-        display_name: request.display_name.trim().to_string(),
-        avatar_color: "#5b8cff".to_string(),
-        blocked_pubkeys: Default::default(),
-        accepted_eula: true,
-        accepted_location_disclosure: true,
-        enabled_background_location: true,
-    };
-
-    let descriptor = VaultDescriptor {
-        version: DESCRIPTOR_VERSION,
-        keystore_alias: vault.keystore_alias(),
-        repo_full_name: repo.full_name(),
-        current_epoch: 0,
-    };
-    vault.store_group_contents(
-        &VaultContents {
-            pat: group_token.to_string(),
-            group_key: zeroize::Zeroizing::new(*group_key),
-        },
-        &descriptor,
-        Some(StoredGroup {
-            invite: invite_payload.clone(),
-            identity_secret: *identity.secret_bytes(),
-            preferences: preferences.clone(),
-            is_host: true,
-            uploads: Vec::new(),
-            invite_code: Some(invite.clone()),
-            roles: Vec::new(),
-        }),
-    )?;
-
-    let group_state = GroupState::from_invite(&invite_payload, identity, preferences, true)?;
-    let fingerprint = group_state.identity.fingerprint();
-    *state.group.write() = Some(Arc::new(group_state));
-
-    Ok(CreateGroupResponse {
-        invite,
-        fingerprint,
-        repo_full_name: repo.full_name(),
-        token_login,
-        has_admin_scope,
-        release_id,
-    })
-}
-
 /// Join a group with an invite string.
 #[tauri::command]
 pub async fn join_group(
@@ -1567,52 +1081,32 @@ pub async fn join_group(
 
     let identity = Identity::generate()?;
 
-    // The two backends differ in what "verify access" even means: GitHub checks a
-    // token against a repository, Nostr generates a keypair and checks whether
-    // this device already has a slot.
-    let (repo, already_member, stored_secret) = match invite.backend {
-        crate::storage::BackendKind::Nostr => {
-            let nostr_identity = crate::nostr::NostrIdentity::generate()?;
-            let store = crate::nostr_store::store_for(
-                &invite.group_id,
-                &invite.relays,
-                &invite.blossom_servers,
-                Arc::new(crate::nostr::NostrIdentity::from_hex(
-                    &nostr_identity.secret_hex(),
-                )?),
-            )?;
+    // Nostr is the only backend: joining generates a fresh keypair and checks
+    // whether this device already has a slot, and whether the host closed the
+    // group.
+    let nostr_identity = crate::nostr::NostrIdentity::generate()?;
+    let store = crate::nostr_store::store_for(
+        &invite.group_id,
+        &invite.relays,
+        &invite.blossom_servers,
+        Arc::new(crate::nostr::NostrIdentity::from_hex(
+            &nostr_identity.secret_hex(),
+        )?),
+    )?;
 
-            // A fresh keypair can never already be a member, but the check keeps
-            // the two paths shaped the same and catches a replayed secret.
-            let already_member = store.has_own_slot().await?;
-            let closures = store.read_closures().await?;
-            if closures.iter().any(|event| group::verify_closure_proof(
-                &invite.host_pubkey, &invite.group_id, &event.content,
-            )) {
-                return Err(AppError::group_state("the host has closed this group; this invite can no longer be used"));
-            }
-            let repo = RepoRef::new("nostr", invite.group_id.clone())?;
-            (repo, already_member, nostr_identity.secret_hex().to_string())
-        }
-        crate::storage::BackendKind::GitHub => {
-            let repo = RepoRef::new(invite.repo_owner.clone(), invite.repo_name.clone())?;
-            let client = GitHubClient::new(repo.clone(), invite.repo_scoped_pat.clone())?;
-
-            // Verify access before storing anything. The invite's issue numbers
-            // are authoritative, so the repair pass only confirms they exist.
-            client.validate_token().await?;
-            client
-                .ensure_schema_issues(invite.roster_issue_num, invite.chat_issue_num)
-                .await?;
-
-            // Decide whether this is a re-join by looking for an existing comment.
-            let existing = client.list_comments(invite.roster_issue_num).await?;
-            let already_member = existing
-                .iter()
-                .any(|comment| comment.author_login == repo.owner);
-            (repo, already_member, invite.repo_scoped_pat.clone())
-        }
-    };
+    // A fresh keypair can never already be a member, but the check keeps the
+    // path honest and catches a replayed secret.
+    let already_member = store.has_own_slot().await?;
+    let closures = store.read_closures().await?;
+    if closures.iter().any(|event| {
+        group::verify_closure_proof(&invite.host_pubkey, &invite.group_id, &event.content)
+    }) {
+        return Err(AppError::group_state(
+            "the host has closed this group; this invite can no longer be used",
+        ));
+    }
+    let group_ref = format!("nostr:{}", invite.group_id);
+    let stored_secret = nostr_identity.secret_hex().to_string();
 
     let preferences = Preferences {
         display_name: request.display_name.trim().to_string(),
@@ -1626,12 +1120,12 @@ pub async fn join_group(
     let descriptor = VaultDescriptor {
         version: DESCRIPTOR_VERSION,
         keystore_alias: vault.keystore_alias(),
-        repo_full_name: repo.full_name(),
+        group_ref: group_ref.clone(),
         current_epoch: invite.key_epoch,
     };
     vault.store_group_contents(
         &VaultContents {
-            pat: stored_secret,
+            secret: stored_secret,
             group_key: zeroize::Zeroizing::new(*invite.group_key()),
         },
         &descriptor,
@@ -1651,11 +1145,8 @@ pub async fn join_group(
     *state.group.write() = Some(Arc::new(group_state));
 
     Ok(JoinGroupResponse {
-        repo_full_name: repo.full_name(),
+        group_ref,
         group_label: invite.group_label.clone(),
-        roster_issue_num: invite.roster_issue_num,
-        chat_issue_num: invite.chat_issue_num,
-        release_id: invite.release_id,
         key_epoch: invite.key_epoch,
         fingerprint,
         already_member,
@@ -1699,26 +1190,14 @@ pub async fn update_location(
     let body = serde_json::to_string(&envelope)
         .map_err(|e| AppError::crypto(format!("could not serialize the envelope: {e}")))?;
 
-    let outcome = if state.is_nostr()? {
+    let outcome = {
         // Addressable event: republishing replaces this member's slot, so there
         // is no comment id to track and no way to collide with another member.
         let store = state.nostr_store()?;
         store
             .publish_roster(&body)
             .await
-            .map(|_| crate::github_db::nostr_numeric_id(group_state.identity.pubkey_b64.as_str()))
-    } else {
-        let client = state.client()?;
-        let comment_id = *group_state.my_comment_id.read();
-        match comment_id {
-            // A member only ever PATCHes their own comment, which is why
-            // concurrent location updates from many phones never conflict.
-            Some(id) => client.update_comment(id, &body).await.map(|c| c.id),
-            None => client
-                .create_comment(group_state.roster_issue_num, &body)
-                .await
-                .map(|c| c.id),
-        }
+            .map(|_| crate::wire::nostr_numeric_id(group_state.identity.pubkey_b64.as_str()))
     };
 
     match outcome {
@@ -1745,7 +1224,7 @@ pub async fn update_location(
 #[tauri::command]
 pub async fn poll_roster(state: State<'_, AppState>) -> Result<PollResponse> {
     let group_state = state.group()?;
-    let now_s = crate::github_db::now_unix_s();
+    let now_s = crate::wire::now_unix_s();
 
     if let Some(remaining) = group_state.halt_remaining_secs(now_s) {
         return Ok(PollResponse {
@@ -1756,39 +1235,17 @@ pub async fn poll_roster(state: State<'_, AppState>) -> Result<PollResponse> {
         });
     }
 
-    if state.is_nostr()? {
-        // Relays push, so there is no conditional-GET path and no quota to
-        // observe. The cadence is still returned so the UI keeps a timer.
-        let store = state.nostr_store()?;
-        let comments = store.read_roster().await?;
-        group_state.apply_roster(&comments);
-        if let Ok(controls) = store.read_control().await {
-            group_state.apply_role_controls(&controls);
-        }
-        announce_roles_if_needed(state.clone(), &group_state).await;
-        return Ok(PollResponse {
-            next_delay_ms: group_state.roster_delay(false).await.as_millis() as u64,
-            not_modified: false,
-            rate_limited: false,
-            halt_remaining_secs: None,
-        });
+    // Relays push, so there is no conditional-GET path and no quota to observe.
+    let store = state.nostr_store()?;
+    let comments = store.read_roster().await?;
+    group_state.apply_roster(&comments);
+    if let Ok(controls) = store.read_control().await {
+        group_state.apply_role_controls(&controls);
     }
-
-    let client = state.client()?;
-    let (comments, not_modified) = client
-        .list_comments_conditional(group_state.roster_issue_num)
-        .await?;
-
-    if !not_modified {
-        group_state.apply_roster(&comments);
-        group_state.apply_role_controls(&comments);
-        announce_roles_if_needed(state.clone(), &group_state).await;
-    }
-    group_state.observe_rate_limit(200, None, None, None);
-
+    announce_roles_if_needed(state.clone(), &group_state).await;
     Ok(PollResponse {
-        next_delay_ms: group_state.roster_delay(not_modified).await.as_millis() as u64,
-        not_modified,
+        next_delay_ms: group_state.roster_delay(false).await.as_millis() as u64,
+        not_modified: false,
         rate_limited: false,
         halt_remaining_secs: None,
     })
@@ -1798,7 +1255,7 @@ pub async fn poll_roster(state: State<'_, AppState>) -> Result<PollResponse> {
 #[tauri::command]
 pub async fn poll_chat(state: State<'_, AppState>) -> Result<PollResponse> {
     let group_state = state.group()?;
-    let now_s = crate::github_db::now_unix_s();
+    let now_s = crate::wire::now_unix_s();
 
     if let Some(remaining) = group_state.halt_remaining_secs(now_s) {
         return Ok(PollResponse {
@@ -1809,71 +1266,32 @@ pub async fn poll_chat(state: State<'_, AppState>) -> Result<PollResponse> {
         });
     }
 
-    if state.is_nostr()? {
-        let store = state.nostr_store()?;
-        let comments = store.read_chat().await?;
-        let removals = store.read_file_removals().await?;
-        group_state.apply_chat(&comments);
-        group_state.apply_file_removals(&removals);
-        return Ok(PollResponse {
-            next_delay_ms: group_state.chat_delay(false).await.as_millis() as u64,
-            not_modified: false,
-            rate_limited: false,
-            halt_remaining_secs: None,
-        });
-    }
-
-    let client = state.client()?;
-    let (comments, not_modified) = client
-        .list_comments_conditional(group_state.chat_issue_num)
-        .await?;
-
-    if !not_modified {
-        group_state.apply_chat(&comments);
-    }
-    group_state.observe_rate_limit(200, None, None, None);
-
+    let store = state.nostr_store()?;
+    let comments = store.read_chat().await?;
+    let removals = store.read_file_removals().await?;
+    group_state.apply_chat(&comments);
+    group_state.apply_file_removals(&removals);
     Ok(PollResponse {
-        next_delay_ms: group_state.chat_delay(not_modified).await.as_millis() as u64,
-        not_modified,
+        next_delay_ms: group_state.chat_delay(false).await.as_millis() as u64,
+        not_modified: false,
         rate_limited: false,
         halt_remaining_secs: None,
     })
 }
 
-/// Report the current rate-limit state by querying GitHub directly.
+/// Report the current rate-limit state.
+///
+/// Nostr has no shared request budget: relays push, and each member signs with
+/// its own key, so there is nothing to throttle. The command stays so the UI
+/// keeps a stable surface.
 #[tauri::command]
 pub async fn refresh_rate_limit(state: State<'_, AppState>) -> Result<PollResponse> {
-    let group_state = state.group()?;
-
-    // Nostr has no shared request budget: relays push, and each member signs with
-    // its own key, so there is nothing to throttle.
-    if state.is_nostr()? {
-        return Ok(PollResponse {
-            next_delay_ms: 0,
-            not_modified: false,
-            rate_limited: false,
-            halt_remaining_secs: None,
-        });
-    }
-
-    let client = state.client()?;
-    let snapshot = client.rate_limit().await?;
-
-    group_state.observe_rate_limit(
-        if snapshot.is_exhausted() { 429 } else { 200 },
-        snapshot.reset_unix_s,
-        snapshot.remaining,
-        snapshot.limit,
-    );
-
-    let now_s = crate::github_db::now_unix_s();
-    let remaining = group_state.halt_remaining_secs(now_s);
+    let _ = state.group()?;
     Ok(PollResponse {
-        next_delay_ms: remaining.map(|r| (r.max(1) as u64) * 1_000).unwrap_or(0),
+        next_delay_ms: 0,
         not_modified: false,
-        rate_limited: remaining.is_some(),
-        halt_remaining_secs: remaining,
+        rate_limited: false,
+        halt_remaining_secs: None,
     })
 }
 
@@ -2013,7 +1431,7 @@ pub fn diagnostics(state: State<'_, AppState>) -> Result<DiagnosticsResponse> {
         let blocked_count = group_state.blocked_sorted().len();
 
         Ok(DiagnosticsResponse {
-            repo_full_name: group_state.backend.location(),
+            group_ref: group_state.backend.location(),
             group_label: group_state.group_label.clone(),
             backend: group_state.backend.kind().as_str().to_string(),
             accountless: !group_state.backend.kind().requires_account(),
@@ -2048,24 +1466,19 @@ pub async fn send_text(
     let body = serde_json::to_string(&envelope)
         .map_err(|e| AppError::crypto(format!("could not serialize the envelope: {e}")))?;
 
-    let created = if state.is_nostr()? {
+    let created = {
         let store = state.nostr_store()?;
         let event_id = store.publish_chat(&body).await?;
         // Reflect the send locally without a round trip, using the same shape a
         // relay read would produce.
-        crate::github_db::IssueComment {
-            id: crate::github_db::nostr_numeric_id(&event_id),
+        crate::wire::IssueComment {
+            id: crate::wire::nostr_numeric_id(&event_id),
             body,
             created_at_ms: now_unix_ms(),
             updated_at_ms: now_unix_ms(),
             author_login: store.pubkey_hex().to_string(),
             nostr_event_id: Some(event_id),
         }
-    } else {
-        let client = state.client()?;
-        client
-            .create_comment(group_state.chat_issue_num, &body)
-            .await?
     };
 
     group_state.append_chat(&created);
@@ -2091,50 +1504,20 @@ pub async fn send_file(
     if request.data.is_empty() {
         return Err(AppError::invalid_argument("cannot share an empty file"));
     }
-    crate::github_db::enforce_file_size(request.data.len() as u64)?;
+    crate::wire::enforce_file_size(request.data.len() as u64)?;
 
     let plaintext_digest = crypto::sha256_b64(&request.data);
     let key = group_state.current_group_key()?;
     let sealed = crypto::seal_blob(&key, &request.data)?;
 
-    let nostr = state.is_nostr()?;
-
-    // Reclaim space first, so the upload does not push the vault past its ceiling.
     // Blossom is content-addressed and has no per-group quota to prune.
-    let pruned_count = if nostr {
-        0
-    } else {
-        let client = state.client()?;
-        client
-            .prune_vault(group_state.release_id, sealed.len() as u64)
-            .await?
-            .to_delete
-            .len()
-    };
+    let pruned_count = 0;
 
-    // On Nostr the asset name is the content address, which is what makes the
-    // pointer verifiable and deduplicates identical files.
-    let uploaded = if nostr {
-        let store = state.nostr_store()?;
-        Some(store.upload_blob(&sealed).await?)
-    } else {
-        None
-    };
-    let asset_name = if let Some(upload) = &uploaded {
-        upload.blob.sha256.clone()
-    } else {
-        let client = state.client()?;
-        let name = format!("{}.bin", uuid::Uuid::new_v4());
-        client
-            .upload_asset(
-                group_state.release_id,
-                &name,
-                &sealed,
-                "application/octet-stream",
-            )
-            .await?;
-        name
-    };
+    // The asset name is the content address, which is what makes the pointer
+    // verifiable and deduplicates identical files.
+    let store = state.nostr_store()?;
+    let upload = store.upload_blob(&sealed).await?;
+    let asset_name = upload.blob.sha256.clone();
 
     // Announce the pointer only after the blob exists, so no member ever sees a
     // dangling reference.
@@ -2149,10 +1532,8 @@ pub async fn send_file(
     let body = serde_json::to_string(&envelope)
         .map_err(|e| AppError::crypto(format!("could not serialize the envelope: {e}")))?;
 
-    let (created, vault_bytes) = if nostr {
-        let store = state.nostr_store()?;
+    let (created, vault_bytes) = {
         let event = store.file_event(&body)?;
-        let upload = uploaded.as_ref().ok_or_else(|| AppError::group_state("uploaded Blossom file metadata is missing"))?;
         state.vault()?.save_upload(StoredUpload {
             sha256: upload.blob.sha256.clone(),
             server: upload.server.clone(),
@@ -2166,8 +1547,8 @@ pub async fn send_file(
         )))?;
         store.publish_file(&event).await?;
         let event_id = event.id;
-        let comment = crate::github_db::IssueComment {
-            id: crate::github_db::nostr_numeric_id(&event_id),
+        let comment = crate::wire::IssueComment {
+            id: crate::wire::nostr_numeric_id(&event_id),
             body,
             created_at_ms: now_unix_ms(),
             updated_at_ms: now_unix_ms(),
@@ -2176,13 +1557,6 @@ pub async fn send_file(
         };
         // Blossom has no per-group quota, so report the blob size instead.
         (comment, sealed.len() as u64)
-    } else {
-        let client = state.client()?;
-        let comment = client
-            .create_comment(group_state.chat_issue_num, &body)
-            .await?;
-        let bytes = client.vault_size(group_state.release_id).await?;
-        (comment, bytes)
     };
     group_state.append_chat(&created);
 
@@ -2207,16 +1581,9 @@ pub async fn download_file(
         return Err(AppError::invalid_argument("an asset name is required"));
     }
 
-    let sealed = if state.is_nostr()? {
-        // On Nostr the asset name is the content address, so the fetch is
-        // self-verifying: `download_blob` rejects bytes that do not hash to it.
-        state.nostr_store()?.download_blob(&asset_name).await?
-    } else {
-        state
-            .client()?
-            .download_asset(group_state.release_id, &asset_name)
-            .await?
-    };
+    // The asset name is the content address, so the fetch is self-verifying:
+    // `download_blob` rejects bytes that do not hash to it.
+    let sealed = state.nostr_store()?.download_blob(&asset_name).await?;
     let key = group_state.current_group_key()?;
     let plaintext = crypto::open_blob(&key, &sealed)?;
 
@@ -2283,31 +1650,20 @@ pub async fn report_content(
     let body = serde_json::to_string(&envelope)
         .map_err(|e| AppError::crypto(format!("could not serialize the envelope: {e}")))?;
 
-    let created = if state.is_nostr()? {
+    let created = {
         // Nostr has no server-side deletion: an event is signed by its author, so
         // only the author can retract it, and even then relays may ignore the
         // request. The flag is published and the block list does the enforcement.
         let store = state.nostr_store()?;
         let event_id = store.publish_chat(&body).await?;
-        crate::github_db::IssueComment {
-            id: crate::github_db::nostr_numeric_id(&event_id),
+        crate::wire::IssueComment {
+            id: crate::wire::nostr_numeric_id(&event_id),
             body,
             created_at_ms: now_unix_ms(),
             updated_at_ms: now_unix_ms(),
             author_login: store.pubkey_hex().to_string(),
             nostr_event_id: Some(event_id),
         }
-
-    } else {
-        let client = state.client()?;
-        // The host additionally removes the offending comment, which is the only
-        // server-side enforcement available with a shared token.
-        if group_state.is_host {
-            client.delete_comment(request.target_comment_id).await?;
-        }
-        client
-            .create_comment(group_state.chat_issue_num, &body)
-            .await?
     };
     group_state.append_chat(&created);
 
@@ -2358,16 +1714,11 @@ pub fn blocked_members(state: State<'_, AppState>) -> Result<Vec<String>> {
 pub async fn check_rotation(state: State<'_, AppState>) -> Result<Option<RotationStatus>> {
     let group_state = state.group()?;
 
-    let comments = if state.is_nostr()? {
+    let comments = {
         let store = state.nostr_store()?;
         let mut comments = store.read_roster().await?;
         comments.extend(store.read_rotations().await?);
         comments
-    } else {
-        state
-            .client()?
-            .list_comments(group_state.roster_issue_num)
-            .await?
     };
     for comment in comments {
         let envelope: crate::crypto::EncryptedEnvelope = match serde_json::from_str(&comment.body) {
@@ -2412,7 +1763,7 @@ pub fn share_invite(state: State<'_, AppState>, request: ShareInviteRequest) -> 
     if request.join_password.is_empty() {
         return Err(AppError::invalid_argument("the join password is required to pack the group code"));
     }
-    let invite = pack_current_invite(&group_state, &request.join_password, &state.pat_for_invites()?)?;
+    let invite = pack_current_invite(&group_state, &request.join_password)?;
     vault.save_invite_code(&invite)?;
     Ok(ShareInviteResponse {
         invite,
@@ -2451,14 +1802,9 @@ pub async fn rotate_group_key(
         ));
     }
 
-    let removed_pubkeys = if state.is_nostr()? {
+    let removed_pubkeys = {
         confirm_removals(&group_state, &request.remove_pubkeys)?;
         request.remove_pubkeys.clone()
-    } else {
-        let client = state.client()?;
-        let comments = client.list_comments(group_state.roster_issue_num).await?;
-        group_state.apply_roster(&comments);
-        delete_removed_members(&client, &group_state, &request.remove_pubkeys).await?
     };
 
     let new_epoch = group_state
@@ -2482,31 +1828,25 @@ pub async fn rotate_group_key(
 
     // Announce under the new key before installing it locally, so a failed publish
     // does not leave this device ahead of everyone else.
-    if state.is_nostr()? {
-        state.nostr_store()?.publish_rotation(&body).await?;
-    } else {
-        state.client()?.create_comment(group_state.roster_issue_num, &body).await?;
-    }
+    state.nostr_store()?.publish_rotation(&body).await?;
 
     group_state.apply_rotation(new_epoch, new_key)?;
     let descriptor = VaultDescriptor {
         version: DESCRIPTOR_VERSION,
         keystore_alias: vault.keystore_alias(),
-        repo_full_name: group_state.repo.full_name(),
+        group_ref: format!("nostr:{}", group_state.group_id),
         current_epoch: new_epoch,
     };
     vault.update_group_key(&new_key, &descriptor)?;
 
-    let pat = state.pat_for_invites()?;
     let invites = build_member_invites(
         &group_state,
         &request.join_password,
         new_epoch,
         &new_key,
         &removed_pubkeys,
-        &pat,
     )?;
-    let group_invite = pack_current_invite(&group_state, &request.join_password, &pat)?;
+    let group_invite = pack_current_invite(&group_state, &request.join_password)?;
     let _ = vault.save_invite_code(&group_invite);
 
     Ok(RotateResponse {
@@ -2518,65 +1858,6 @@ pub async fn rotate_group_key(
     })
 }
 
-/// Replace the group token without touching the group key.
-#[tauri::command]
-pub async fn rekey_group(
-    state: State<'_, AppState>,
-    request: RekeyRequest,
-) -> Result<RekeyResponse> {
-    let vault = state.vault()?;
-    let group_state = state.group()?;
-
-    if !group_state.is_host {
-        return Err(AppError::group_state(
-            "only the host may re-issue invites with a new token",
-        ));
-    }
-    if request.new_pat.trim().is_empty() {
-        return Err(AppError::invalid_argument("a replacement token is required"));
-    }
-    if request.join_password.is_empty() {
-        return Err(AppError::invalid_argument(
-            "a join password is required to re-issue invites",
-        ));
-    }
-
-    // The new token must work before it replaces a working one.
-    let client = GitHubClient::new(group_state.repo.clone(), request.new_pat.clone())?;
-    let token_login = client.validate_token().await?;
-    client
-        .ensure_schema_issues(group_state.roster_issue_num, group_state.chat_issue_num)
-        .await?;
-    client.ensure_release(&request.release_tag.clone().unwrap_or_else(|| "vault-v1".into())).await?;
-
-    let epoch = group_state.current_epoch();
-    let key = group_state.current_group_key()?;
-
-    let descriptor = VaultDescriptor {
-        version: DESCRIPTOR_VERSION,
-        keystore_alias: vault.keystore_alias(),
-        repo_full_name: group_state.repo.full_name(),
-        current_epoch: epoch,
-    };
-    vault.update_pat(&request.new_pat, &descriptor)?;
-
-    let invites = build_member_invites(
-        &group_state,
-        &request.join_password,
-        epoch,
-        &key,
-        &[],
-            &request.new_pat,
-        )?;
-
-    Ok(RekeyResponse {
-        token_valid: true,
-        token_login,
-        invites,
-        key_epoch: epoch,
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Leaving and destroying
 // ---------------------------------------------------------------------------
@@ -2584,26 +1865,18 @@ pub async fn rekey_group(
 /// Leave the group: delete this device's roster comment, then wipe locally.
 #[tauri::command]
 pub async fn leave_and_wipe(state: State<'_, AppState>) -> Result<WipeResponse> {
-    let group_state = state.group()?;
+    let _group_state = state.group()?;
 
     // Deleting the roster entry is best-effort: if it fails, the user's intent to
     // wipe locally still has to be honoured, otherwise their data stays on a
     // device they are trying to clean.
-    let roster_comment_deleted = if state.is_nostr()? {
+    let roster_comment_deleted = {
         // A Nostr slot can only be retracted by its author, and relays may ignore
         // the request. Publishing an empty slot is the closest equivalent, and a
         // failure here must not block the local wipe.
         match state.nostr_store() {
             Ok(store) => store.publish_roster("").await.is_ok(),
             Err(_) => false,
-        }
-    } else {
-        // Copy the id out before awaiting: holding a `parking_lot` guard across
-        // an await makes the future non-Send.
-        let comment_id = *group_state.my_comment_id.read();
-        match comment_id {
-            Some(id) => state.client()?.delete_comment(id).await.is_ok(),
-            None => true,
         }
     };
 
@@ -2621,7 +1894,7 @@ pub async fn leave_and_wipe(state: State<'_, AppState>) -> Result<WipeResponse> 
     })
 }
 
-/// Destroy the group repository. Host-only in the UI, but enforced by the token.
+/// Destroy the group by publishing a closure signed by the host.
 #[tauri::command]
 pub async fn destroy_group(state: State<'_, AppState>) -> Result<DestroyResponse> {
     let group_state = state.group()?;
@@ -2632,49 +1905,21 @@ pub async fn destroy_group(state: State<'_, AppState>) -> Result<DestroyResponse
         ));
     }
 
-    if state.is_nostr()? {
-        let store = state.nostr_store()?;
-        let proof = group_state.closure_proof()?;
-        let accepted_relays = store.publish_closure(&proof).await?;
-        let unconfirmed_relays = store.relays.iter()
-            .filter(|url| !accepted_relays.contains(url))
-            .cloned()
-            .collect();
-        state.vault()?.wipe()?;
-        *state.group.write() = None;
-        *state.vault.write() = None;
-        return Ok(DestroyResponse {
-            repo_full_name: format!("nostr:{}", group_state.group_id),
-            vault_wiped: true,
-            accepted_relays,
-            unconfirmed_relays,
-        });
-    }
-
-    let client = state.client()?;
-    let repo_full_name = group_state.repo.full_name();
-
-    // Require admin scope up front, so the failure message says what to fix
-    // instead of surfacing a bare 403.
-    if !client.has_admin_scope().await.unwrap_or(false) {
-        return Err(AppError::GitHubAuth { status: 403 });
-    }
-
-    client.delete_repository().await?;
-
-    let vault_wiped = match state.vault.read().clone() {
-        Some(vault) => vault.wipe().is_ok(),
-        None => true,
-    };
-
+    let store = state.nostr_store()?;
+    let proof = group_state.closure_proof()?;
+    let accepted_relays = store.publish_closure(&proof).await?;
+    let unconfirmed_relays = store.relays.iter()
+        .filter(|url| !accepted_relays.contains(url))
+        .cloned()
+        .collect();
+    state.vault()?.wipe()?;
     *state.group.write() = None;
     *state.vault.write() = None;
-
     Ok(DestroyResponse {
-        repo_full_name,
-        vault_wiped,
-        accepted_relays: Vec::new(),
-        unconfirmed_relays: Vec::new(),
+        group_ref: format!("nostr:{}", group_state.group_id),
+        vault_wiped: true,
+        accepted_relays,
+        unconfirmed_relays,
     })
 }
 
@@ -2686,9 +1931,6 @@ pub async fn check_group_closed(state: State<'_, AppState>) -> Result<bool> {
 
 async fn check_group_closed_inner(state: &AppState) -> Result<bool> {
     let group_state = state.group()?;
-    if !state.is_nostr()? {
-        return Ok(false);
-    }
     let store = state.nostr_store()?;
     let events = store.read_closures().await?;
     if !events.iter().any(|event| group_state.verifies_closure(&store.group_id, &event.content)) {
@@ -2707,46 +1949,23 @@ async fn check_group_closed_inner(state: &AppState) -> Result<bool> {
 /// List the encrypted blobs and current storage usage.
 #[tauri::command]
 pub async fn vault_report(state: State<'_, AppState>) -> Result<VaultReport> {
-    let group_state = state.group()?;
+    let _group_state = state.group()?;
 
     // The local encrypted index contains only uploads made by this device.
-    if state.is_nostr()? {
-        let stored = state.vault()?.load_group()?.ok_or_else(|| AppError::vault("the stored group cannot be restored"))?;
-        let assets: Vec<VaultAssetView> = stored.uploads.iter().map(|upload| VaultAssetView {
-            id: crate::github_db::nostr_numeric_id(&upload.event.id),
-            name: upload.sha256.clone(),
-            size: upload.size,
-            created_at_ms: upload.event.created_at.saturating_mul(1_000),
-            deletion_status: Some(if !upload.deleted { "available" } else if upload.notice_published { "announced" } else { "notice_pending" }.into()),
-        }).collect();
-        let total_bytes = stored.uploads.iter().filter(|upload| !upload.deleted).map(|upload| upload.size).sum();
-        return Ok(VaultReport {
-            assets,
-            total_bytes,
-            max_bytes: crate::github_db::MAX_VAULT_BYTES,
-            rate_limit_remaining: None,
-        });
-    }
-
-    let client = state.client()?;
-    let assets = client.list_assets(group_state.release_id).await?;
-    let total_bytes: u64 = assets.iter().map(|a| a.size).sum();
-    let snapshot = client.rate_limit().await.ok();
-
+    let stored = state.vault()?.load_group()?.ok_or_else(|| AppError::vault("the stored group cannot be restored"))?;
+    let assets: Vec<VaultAssetView> = stored.uploads.iter().map(|upload| VaultAssetView {
+        id: crate::wire::nostr_numeric_id(&upload.event.id),
+        name: upload.sha256.clone(),
+        size: upload.size,
+        created_at_ms: upload.event.created_at.saturating_mul(1_000),
+        deletion_status: Some(if !upload.deleted { "available" } else if upload.notice_published { "announced" } else { "notice_pending" }.into()),
+    }).collect();
+    let total_bytes = stored.uploads.iter().filter(|upload| !upload.deleted).map(|upload| upload.size).sum();
     Ok(VaultReport {
-        assets: assets
-            .into_iter()
-            .map(|asset| VaultAssetView {
-                id: asset.id,
-                name: asset.name,
-                size: asset.size,
-                created_at_ms: asset.created_at_ms,
-                deletion_status: None,
-            })
-            .collect(),
+        assets,
         total_bytes,
-        max_bytes: crate::github_db::MAX_VAULT_BYTES,
-        rate_limit_remaining: snapshot.and_then(|s| s.remaining),
+        max_bytes: crate::wire::MAX_VAULT_BYTES,
+        rate_limit_remaining: None,
     })
 }
 
@@ -2813,24 +2032,17 @@ async fn delete_nostr_blob_inner(state: &AppState, sha256: String) -> Result<Blo
     })
 }
 
-/// Delete one GitHub blob from the vault.
+/// Delete one blob from the vault.
+///
+/// Blossom blobs are content-addressed and shared: deleting one would break
+/// every pointer to it, including other members' messages. Refuse rather than
+/// silently corrupting the group's history.
 #[tauri::command]
 pub async fn delete_asset(state: State<'_, AppState>, asset_id: u64) -> Result<()> {
-    let group_state = state.group()?;
-
-    if state.is_nostr()? {
-        // Blossom blobs are content-addressed and shared: deleting one would
-        // break every pointer to it, including other members' messages. Refuse
-        // rather than silently corrupting the group's history.
-        return Err(AppError::invalid_argument(
-            "files on Nostr are content-addressed and cannot be deleted individually",
-        ));
-    }
-
-    let client = state.client()?;
-    client.delete_asset(asset_id).await?;
-    group_state.reset_cadence();
-    Ok(())
+    let _ = (state, asset_id);
+    Err(AppError::invalid_argument(
+        "files on Nostr are content-addressed and cannot be deleted individually",
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2863,16 +2075,6 @@ fn validate_hex_color(value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Generate a repository name that is unlikely to collide.
-///
-/// Matches the `grp-<hex>` shape the UI has always suggested, so a provisioned
-/// repository is recognisable in the account's repository list.
-fn generate_repo_name() -> String {
-    let bytes = uuid::Uuid::new_v4().into_bytes();
-    let suffix: String = bytes[..4].iter().map(|b| format!("{b:02x}")).collect();
-    format!("grp-{suffix}")
-}
-
 /// Republish saved roles once per session so a restarted owner does not lose them on relays.
 async fn announce_roles_if_needed(state: State<'_, AppState>, group_state: &GroupState) {
     if !group_state.is_host || *group_state.roles_announced.read() || group_state.role_grants().is_empty() {
@@ -2887,11 +2089,7 @@ async fn publish_role_set(state: &State<'_, AppState>, group_state: &GroupState)
     let envelope = group_state.build_role_envelope(now_unix_ms())?;
     let body = serde_json::to_string(&envelope)
         .map_err(|e| AppError::crypto(format!("could not serialize the role set: {e}")))?;
-    if state.is_nostr()? {
-        state.nostr_store()?.publish_control(&body).await?;
-    } else {
-        state.client()?.create_comment(group_state.roster_issue_num, &body).await?;
-    }
+    state.nostr_store()?.publish_control(&body).await?;
     Ok(())
 }
 
@@ -2906,21 +2104,14 @@ fn stored_roles(group_state: &GroupState) -> Vec<crate::vault::StoredRole> {
         .collect()
 }
 
-fn pack_current_invite(group_state: &GroupState, join_password: &str, repo_scoped_pat: &str) -> Result<String> {
+fn pack_current_invite(group_state: &GroupState, join_password: &str) -> Result<String> {
     let payload = InviteCredentialsPayload {
         version: PROTOCOL_VERSION,
         backend: group_state.backend.kind(),
-        repo_owner: group_state.repo.owner.clone(),
-        repo_name: group_state.repo.name.clone(),
-        repo_scoped_pat: repo_scoped_pat.to_string(),
+        group_id: group_state.group_id.clone(),
         group_master_key: group_state.current_group_key()?,
-        roster_issue_num: group_state.roster_issue_num,
-        chat_issue_num: group_state.chat_issue_num,
-        release_id: group_state.release_id,
-        repo_created: true,
         relays: group_state.relays.clone(),
         blossom_servers: group_state.blossom_servers.clone(),
-        group_id: group_state.group_id.clone(),
         host_pubkey: group_state.host_pubkey_b64.clone(),
         group_label: group_state.group_label.clone(),
         key_epoch: group_state.current_epoch(),
@@ -2943,45 +2134,18 @@ fn confirm_removals(group_state: &GroupState, remove_pubkeys: &[String]) -> Resu
     Ok(())
 }
 
-async fn delete_removed_members(
-    client: &crate::github_db::GitHubClient,
-    group_state: &GroupState,
-    remove_pubkeys: &[String],
-) -> Result<Vec<String>> {
-    confirm_removals(group_state, remove_pubkeys)?;
-    let member_ids = group::comment_ids_by_pubkey(&group_state.roster.read());
-    let mut removed = Vec::new();
-    for pubkey in remove_pubkeys {
-        let comment_id = member_ids.get(pubkey).copied().ok_or_else(|| {
-            AppError::group_state(format!(
-                "member {pubkey} is not in the current roster, so it cannot be removed"
-            ))
-        })?;
-        client.delete_comment(comment_id).await?;
-        removed.push(pubkey.clone());
-    }
-    Ok(removed)
-}
-
 /// Build one invite per member, excluding removed members.
 ///
-/// The PAT is passed in explicitly because it lives in the vault, not in group
-/// state; taking it as an argument makes it obvious at each call site that a
-/// secret is being embedded.
+/// The group key is passed in explicitly because it lives in the vault, not in
+/// group state; taking it as an argument makes it obvious at each call site that
+/// a secret is being embedded.
 fn build_member_invites(
     group_state: &GroupState,
     join_password: &str,
     epoch: u8,
     group_key: &[u8; 32],
     excluded: &[String],
-    repo_scoped_pat: &str,
 ) -> Result<Vec<MemberInvite>> {
-    if group_state.backend.kind().requires_account() && repo_scoped_pat.trim().is_empty() {
-        return Err(AppError::NotConfigured(
-            "no group token is stored, so invites cannot be re-issued".into(),
-        ));
-    }
-
     let mut invites = Vec::new();
 
     for member in group_state.roster.read().iter() {
@@ -2992,17 +2156,10 @@ fn build_member_invites(
         let payload = InviteCredentialsPayload {
             version: PROTOCOL_VERSION,
             backend: group_state.backend.kind(),
-            repo_owner: group_state.repo.owner.clone(),
-            repo_name: group_state.repo.name.clone(),
-            repo_scoped_pat: repo_scoped_pat.to_string(),
+            group_id: group_state.group_id.clone(),
             group_master_key: *group_key,
-            roster_issue_num: group_state.roster_issue_num,
-            chat_issue_num: group_state.chat_issue_num,
-            release_id: group_state.release_id,
-            repo_created: true,
             relays: group_state.relays.clone(),
             blossom_servers: group_state.blossom_servers.clone(),
-            group_id: group_state.group_id.clone(),
             host_pubkey: group_state.host_pubkey_b64.clone(),
             group_label: group_state.group_label.clone(),
             key_epoch: epoch,
@@ -3055,9 +2212,7 @@ mod tests {
         let invite = InviteCredentialsPayload {
             version: PROTOCOL_VERSION,
             backend: crate::storage::BackendKind::Nostr,
-            repo_owner: String::new(), repo_name: String::new(), repo_scoped_pat: String::new(),
-            group_master_key: [9; 32], roster_issue_num: 0, chat_issue_num: 0, release_id: 0,
-            repo_created: true, relays: vec![relay], blossom_servers: Vec::new(),
+            group_master_key: [9; 32], relays: vec![relay], blossom_servers: Vec::new(),
             group_id: "closure-test".into(), host_pubkey: host.pubkey_b64.clone(),
             group_label: "test".into(), key_epoch: 0,
         };
@@ -3092,8 +2247,8 @@ mod tests {
         let keystore: Arc<dyn crate::vault::Keystore> = Arc::new(crate::vault::InMemoryKeystore::new().expect("keystore"));
         let vault = Arc::new(SecureVault::create(&dir, keystore).expect("vault"));
         let descriptor = VaultDescriptor { version: DESCRIPTOR_VERSION, keystore_alias: vault.keystore_alias(),
-            repo_full_name: "nostr:closure-test".into(), current_epoch: 0 };
-        vault.store_group_contents(&VaultContents { pat: nostr.secret_hex().to_string(), group_key: Zeroizing::new([9; 32]) },
+            group_ref: "nostr:closure-test".into(), current_epoch: 0 };
+        vault.store_group_contents(&VaultContents { secret: nostr.secret_hex().to_string(), group_key: zeroize::Zeroizing::new([9; 32]) },
             &descriptor, Some(StoredGroup { invite: invite.clone(), identity_secret: *guest_identity.secret_bytes(),
                 preferences: test_preferences(), is_host: false, uploads: Vec::new(),
                 invite_code: None, roles: Vec::new() })).expect("store");
@@ -3123,9 +2278,7 @@ mod tests {
         let nostr = crate::nostr::NostrIdentity::from_secret_bytes([42; 32]).expect("nostr");
         let invite = InviteCredentialsPayload {
             version: PROTOCOL_VERSION, backend: crate::storage::BackendKind::Nostr,
-            repo_owner: String::new(), repo_name: String::new(), repo_scoped_pat: String::new(),
-            group_master_key: [8; 32], roster_issue_num: 0, chat_issue_num: 0, release_id: 0,
-            repo_created: true, relays: vec![relay_url], blossom_servers: vec![server_url.clone()],
+            group_master_key: [8; 32], relays: vec![relay_url], blossom_servers: vec![server_url.clone()],
             group_id: "file-test".into(), host_pubkey: host.pubkey_b64.clone(),
             group_label: "test".into(), key_epoch: 0,
         };
@@ -3138,8 +2291,8 @@ mod tests {
         let keystore: Arc<dyn crate::vault::Keystore> = Arc::new(crate::vault::InMemoryKeystore::new().expect("keystore"));
         let vault = Arc::new(SecureVault::create(&dir, keystore).expect("vault"));
         let descriptor = VaultDescriptor { version: DESCRIPTOR_VERSION, keystore_alias: vault.keystore_alias(),
-            repo_full_name: "nostr:file-test".into(), current_epoch: 0 };
-        vault.store_group_contents(&VaultContents { pat: nostr.secret_hex().to_string(), group_key: Zeroizing::new([8; 32]) },
+            group_ref: "nostr:file-test".into(), current_epoch: 0 };
+        vault.store_group_contents(&VaultContents { secret: nostr.secret_hex().to_string(), group_key: zeroize::Zeroizing::new([8; 32]) },
             &descriptor, Some(StoredGroup { invite, identity_secret: *host.secret_bytes(), preferences: test_preferences(),
                 is_host: true, uploads: vec![StoredUpload { sha256: sha256.clone(), server: server_url,
                     size: 6, event: original, deleted: false, notice_published: false }],
@@ -3235,13 +2388,13 @@ mod tests {
         let response = UnlockResponse {
             existed: false,
             group_configured: true,
-            repo_full_name: Some("JaredCH/sandbox".into()),
+            group_ref: Some("nostr:group-1".into()),
             current_epoch: Some(0),
             requires_recovery: false,
         };
         let json = serde_json::to_value(&response).expect("serialize");
         assert!(json.get("groupConfigured").is_some());
-        assert!(json.get("repoFullName").is_some());
+        assert!(json.get("groupRef").is_some());
         assert!(json.get("currentEpoch").is_some());
     }
 
@@ -3249,9 +2402,9 @@ mod tests {
     fn diagnostics_response_serializes_with_camel_case_keys() {
         let response = DiagnosticsResponse {
             group_label: "test".into(),
-            repo_full_name: "JaredCH/sandbox".into(),
-            backend: "github".into(),
-            accountless: false,
+            group_ref: "nostr:group-1".into(),
+            backend: "nostr".into(),
+            accountless: true,
             is_host: true,
             current_epoch: 0,
             known_epochs: vec![0],
@@ -3266,11 +2419,11 @@ mod tests {
             fingerprint: "ABCD1234".into(),
         };
         let json = serde_json::to_value(&response).expect("serialize");
-        assert!(json.get("repoFullName").is_some());
+        assert!(json.get("groupRef").is_some());
         assert!(json.get("knownEpochs").is_some());
         assert!(json.get("chatIntervalS").is_some());
-        assert_eq!(json.get("backend").and_then(|v| v.as_str()), Some("github"));
-        assert_eq!(json.get("accountless").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(json.get("backend").and_then(|v| v.as_str()), Some("nostr"));
+        assert_eq!(json.get("accountless").and_then(|v| v.as_bool()), Some(true));
     }
 
     #[test]
@@ -3282,97 +2435,12 @@ mod tests {
         assert!(request.remove_pubkeys.is_empty());
     }
 
-    #[test]
-    fn create_group_request_requires_core_fields() {
-        let json = r#"{
-            "repoOwner":"JaredCH",
-            "repoName":"shadow720-sandbox",
-            "repoScopedPat":"github_pat_X",
-            "groupLabel":"Trip",
-            "joinPassword":"pw",
-            "displayName":"Jared",
-            "rosterIssueNum":1,
-            "chatIssueNum":2
-        }"#;
-        let request: CreateGroupRequest = serde_json::from_str(json).expect("deserialize");
-        assert_eq!(request.repo_owner.as_deref(), Some("JaredCH"));
-        assert_eq!(request.release_id, 0, "defaulted");
-        assert!(request.release_tag.is_none());
-        assert!(!request.repo_created, "adopt is the default");
-
-        let missing = r#"{"repoOwner":"x"}"#;
-        assert!(serde_json::from_str::<CreateGroupRequest>(missing).is_err());
-    }
-
-    #[test]
-    fn create_group_request_accepts_a_provisioned_repo() {
-        let json = r#"{
-            "repoOwner":"JaredCH",
-            "repoName":"grp-9f8a7b6c",
-            "repoScopedPat":"github_pat_X",
-            "groupLabel":"Trip",
-            "joinPassword":"pw",
-            "displayName":"Jared",
-            "repoCreated":true
-        }"#;
-        let request: CreateGroupRequest = serde_json::from_str(json).expect("deserialize");
-        assert!(request.repo_created);
-        assert_eq!(request.repo_name.as_deref(), Some("grp-9f8a7b6c"));
-        assert_eq!(request.roster_issue_num, 0, "0 means create one");
-        assert_eq!(request.chat_issue_num, 0, "0 means create one");
-    }
-
-    #[test]
-    fn provision_request_requires_an_account_token() {
-        let request: ProvisionRequest =
-            serde_json::from_str(r#"{"accountToken":"ghp_x"}"#).expect("deserialize");
-        assert_eq!(request.account_token.as_deref(), Some("ghp_x"));
-        assert!(request.repo_name.is_none());
-        assert!(request.release_tag.is_none());
-
-        // The token is optional: a completed sign-in supplies it from app state.
-        let signed_in: ProvisionRequest =
-            serde_json::from_str(r#"{"repoName":"grp-1"}"#).expect("deserialize");
-        assert!(signed_in.account_token.is_none());
-    }
 
     #[test]
     fn nostr_store_requires_a_nostr_group() {
         let state = AppState::new();
         // No group at all: the error must say so rather than panicking.
         assert!(state.nostr_store().is_err());
-        assert!(state.is_nostr().is_err());
-    }
-
-    #[test]
-    fn nostr_store_rejects_a_github_group() {
-        let state = AppState::new();
-        let invite = crate::crypto::InviteCredentialsPayload {
-            version: crate::crypto::PROTOCOL_VERSION,
-            backend: crate::storage::BackendKind::GitHub,
-            repo_owner: "o".into(),
-            repo_name: "r".into(),
-            repo_scoped_pat: "github_pat_X".into(),
-            group_master_key: [1u8; 32],
-            roster_issue_num: 1,
-            chat_issue_num: 2,
-            release_id: 3,
-            repo_created: true,
-            relays: Vec::new(),
-            blossom_servers: Vec::new(),
-            group_id: String::new(),
-            host_pubkey: String::new(),
-            group_label: "g".into(),
-            key_epoch: 0,
-        };
-        let identity = Identity::generate().expect("identity");
-        let group = GroupState::from_invite(&invite, identity, test_preferences(), true)
-            .expect("group");
-        *state.group.write() = Some(Arc::new(group));
-
-        assert!(!state.is_nostr().expect("kind"));
-        let error = state.nostr_store().expect_err("must refuse");
-        assert_eq!(error.kind(), crate::error::AppErrorKind::GroupState);
     }
 
     #[test]
@@ -3381,17 +2449,10 @@ mod tests {
         let invite = crate::crypto::InviteCredentialsPayload {
             version: crate::crypto::PROTOCOL_VERSION,
             backend: crate::storage::BackendKind::Nostr,
-            repo_owner: String::new(),
-            repo_name: String::new(),
-            repo_scoped_pat: String::new(),
+            group_id: "group-1".into(),
             group_master_key: [1u8; 32],
-            roster_issue_num: 0,
-            chat_issue_num: 0,
-            release_id: 0,
-            repo_created: true,
             relays: vec!["wss://relay.example".into()],
             blossom_servers: vec!["https://blossom.example".into()],
-            group_id: "group-1".into(),
             host_pubkey: String::new(),
             group_label: "g".into(),
             key_epoch: 0,
@@ -3401,7 +2462,6 @@ mod tests {
             .expect("group");
         *state.group.write() = Some(Arc::new(group));
 
-        assert!(state.is_nostr().expect("kind"));
         // The vault is locked, so the secret cannot be read yet; the error must
         // be about the vault rather than about the backend.
         let error = state.nostr_store().expect_err("vault is locked");
@@ -3420,26 +2480,6 @@ mod tests {
     }
 
     #[test]
-    fn account_token_is_consumed_at_most_once() {
-        let state = AppState::new();
-        assert!(state.take_account_token().is_none(), "starts empty");
-
-        *state.pending_account_token.write() = Some(Zeroizing::new("gho_x".to_string()));
-        let first = state.take_account_token().expect("first take");
-        assert_eq!(first.as_str(), "gho_x");
-        assert!(
-            state.take_account_token().is_none(),
-            "a second take must not hand out the same token"
-        );
-    }
-
-    #[test]
-    fn oauth_client_id_is_never_empty() {
-        let id = oauth_client_id().expect("client id");
-        assert!(!id.trim().is_empty());
-    }
-
-    #[test]
     fn reset_vault_works_while_the_vault_is_locked() {
         // Regression: `reset_vault` used to call `state.vault()`, which fails when
         // no vault is open. The reset button only appears after unlocking failed,
@@ -3451,11 +2491,11 @@ mod tests {
         let vault = SecureVault::create(&dir, keystore).expect("create");
         vault
             .store_contents(
-                &VaultContents { pat: "github_pat_TEST".into(), group_key: Zeroizing::new([7; 32]) },
+                &VaultContents { secret: "nostr_secret_TEST".into(), group_key: zeroize::Zeroizing::new([7; 32]) },
                 &VaultDescriptor {
                     version: DESCRIPTOR_VERSION,
                     keystore_alias: vault.keystore_alias(),
-                    repo_full_name: "o/r".into(),
+                    group_ref: "nostr:group-1".into(),
                     current_epoch: 0,
                 },
             )
@@ -3507,25 +2547,6 @@ mod tests {
         assert!(state.vault.read().is_none(), "the handle must be dropped");
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn begin_sign_in_request_defaults_to_no_destroy_scope() {
-        let request: BeginSignInRequest = serde_json::from_str(r#"{}"#).expect("deserialize");
-        assert!(!request.allow_destroy);
-
-        let opted_in: BeginSignInRequest =
-            serde_json::from_str(r#"{"allowDestroy":true}"#).expect("deserialize");
-        assert!(opted_in.allow_destroy);
-    }
-
-    #[test]
-    fn generated_repo_names_are_unique_and_prefixed() {
-        let first = generate_repo_name();
-        let second = generate_repo_name();
-        assert!(first.starts_with("grp-"));
-        assert_eq!(first.len(), "grp-".len() + 8);
-        assert_ne!(first, second);
     }
 
     #[test]

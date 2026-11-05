@@ -7,7 +7,7 @@
 //!
 //! # Why it is local-only
 //!
-//! History is never published. Relays and GitHub only ever hold a member's
+//! History is never published. Relays only ever hold a member's
 //! *current* position, which is what keeps the group's shared footprint the same
 //! size whether the app has been running for a minute or a month. Each device
 //! records what it can see and nothing more, so a member who was offline for a
@@ -247,7 +247,7 @@ impl TrackHistory {
             members,
             dirty: false,
         };
-        history.prune_all(crate::github_db::now_unix_ms());
+        history.prune_all(crate::wire::now_unix_ms());
         Ok(history)
     }
 
@@ -458,7 +458,7 @@ mod tests {
     fn save_and_load_round_trip_through_the_group_key() {
         let dir = std::env::temp_dir().join(format!("shadow720-history-{}", uuid::Uuid::new_v4()));
         let key = [9u8; GROUP_KEY_LEN];
-        let now = crate::github_db::now_unix_ms();
+        let now = crate::wire::now_unix_ms();
 
         let mut history = TrackHistory::new();
         history.record("a", point(1.0, 1.0, now - 1_000), now);

@@ -1,6 +1,6 @@
 //! Movement gating, polling cadence, jitter, and backoff policy.
 //!
-//! The whole group shares **one** 5,000 req/hour PAT budget, so the client is
+//! Relays push, so there is no shared request budget to police; the client is
 //! deliberately stingy: it refuses to publish a location it does not need to
 //! publish, refuses to poll faster than the plan allows, and spreads every
 //! interval with jitter so 50 phones never align into a thundering herd.
@@ -10,7 +10,7 @@
 //! * [`GeoGate`] — decides whether a new GPS fix is worth a `PATCH` at all
 //!   (Haversine distance + cooldown + heartbeat).
 //! * [`AdaptiveBackoff`] / [`RateLimitHalt`] — decides how long to wait before
-//!   the next poll for a channel, and stops everything when GitHub says stop.
+//!   the next poll for a channel, and stops everything when a relay says stop.
 
 use std::time::Duration;
 
@@ -499,7 +499,7 @@ pub fn apply_jitter(base: Duration, unit: f64) -> Duration {
 
 /// Per-channel polling interval that lengthens when the channel goes quiet.
 ///
-/// GitHub does not charge `304 Not Modified` against the rate limit, but the
+/// A relay does not charge `304 Not Modified` against a budget, but the
 /// *request* still costs a round trip and battery. When a channel has been
 /// unchanged for [`BACKOFF_THRESHOLD`] polls in a row, doubling the interval
 /// trades a little latency for a lot of headroom.
@@ -571,10 +571,10 @@ impl AdaptiveBackoff {
 // RateLimitHalt
 // ---------------------------------------------------------------------------
 
-/// Global "stop polling" switch, driven by GitHub's rate-limit headers.
+/// Global "stop polling" switch, driven by relay rate-limit responses.
 ///
 /// When tripped, **every** channel stops until `reset + padding`. This is the
-/// difference between burning the shared PAT for an hour and recovering.
+/// difference between burning a shared budget for an hour and recovering.
 #[derive(Clone, Debug, Default)]
 pub struct RateLimitHalt {
     halted_until_unix_s: Option<i64>,
@@ -604,7 +604,7 @@ impl RateLimitHalt {
         }
     }
 
-    /// Record the total limit reported by GitHub, for diagnostics.
+/// Record the total limit reported by a relay, for diagnostics.
     pub fn observe_limit(&mut self, limit: Option<u32>) {
         self.last_limit = limit;
     }
