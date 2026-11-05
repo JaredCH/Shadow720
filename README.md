@@ -60,7 +60,7 @@ The difference is what it *doesn't* have.
 
 There is nothing to host, so there is nothing to pay for. The storage is free-tier infrastructure that already exists: public Nostr relays and Blossom blob servers. The app is MIT-licensed and the whole thing runs on your hardware.
 
-### What's new in 0.1.7
+### What's new in 0.1.8
 
 - **Tap a name to fly there.** Selecting a member in the roster centres and zooms the map on them, and turns off "Following you" so the view stays put.
 - **A month of history.** Every device keeps a 31-day track log, grouped by day and week, with distance, dominant activity, and lowest battery per day. It is sealed with the group key and never published.
@@ -109,13 +109,13 @@ The Android APK is signed with a self-signed key, so Android will ask you to all
 
 ```bash
 # Debian / Ubuntu / Mint
-sudo apt install ./Shadow720_0.1.7_amd64.deb
+sudo apt install ./Shadow720_0.1.8_amd64.deb
 
 # Fedora / RHEL / Rocky / Alma
-sudo dnf install ./Shadow720-0.1.7-1.x86_64.rpm
+sudo dnf install ./Shadow720-0.1.8-1.x86_64.rpm
 
 # Any distro, no install
-chmod +x Shadow720_0.1.7_amd64.AppImage && ./Shadow720_0.1.7_amd64.AppImage
+chmod +x Shadow720_0.1.8_amd64.AppImage && ./Shadow720_0.1.8_amd64.AppImage
 ```
 
 The Linux build needs WebKitGTK 4.1 (`libwebkit2gtk-4.1-0`), which the `.deb` and `.rpm` pull in automatically. The AppImage bundles it.

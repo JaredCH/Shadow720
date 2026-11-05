@@ -1,6 +1,6 @@
 [package]
 name = "shadow720"
-version = "0.1.7"
+version = "0.1.8"
 description = "Serverless E2EE Android group app - Nostr relays as an untrusted ciphertext store"
 authors = ["Shadow720"]
 edition = "2021"
