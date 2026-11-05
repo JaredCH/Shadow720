@@ -7,6 +7,10 @@ Companion documents: [PRIVACY_POLICY.md](./PRIVACY_POLICY.md) ·
 [DEMO_VIDEO_SCRIPT.md](./DEMO_VIDEO_SCRIPT.md) ·
 [DATA_SAFETY_WORKSHEET.md](./DATA_SAFETY_WORKSHEET.md)
 
+The canonical public privacy policy lives at
+<https://jaredch.github.io/shadow720-legal/PRIVACY.md> and is what the Play listing
+must point at.
+
 ---
 
 ## 1. App content declarations
@@ -21,13 +25,13 @@ Because data is collected, the following answers apply.
 
 Every payload is sealed on-device with `XChaCha20-Poly1305` before transmission, so
 the data is encrypted *before* it enters the transport as well as during it. The
-transport itself is HTTPS with `rustls`.
+transport itself is WSS/HTTPS with `rustls`.
 
 **Do you provide a way for users to request that their data is deleted?** — Yes.
 
-In-app: **Leave group and wipe my data** deletes the user's entry from the group and
-erases every key and token on the device. Group creators additionally get **Destroy
-group**, which deletes the entire data store.
+In-app: **Leave group and wipe my data** retracts the user's entry from the group and
+erases every key on the device. Group creators additionally get **Destroy group**,
+which publishes a signed closure notice so every member's device wipes its copy.
 
 **Data safety → Data types**
 
@@ -46,8 +50,8 @@ group**, which deletes the entire data store.
 For every "collected" row:
 
 - **Collected or shared:** Collected. It is **not** shared, because it is never
-  transmitted to a third party in a readable form — GitHub receives only ciphertext
-  of which it cannot make use. Under Play's definition, ciphertext sent to a
+  transmitted to a third party in a readable form — relays receive only ciphertext
+  of which they cannot make use. Under Play's definition, ciphertext sent to a
   service the app developer does not control or read is not "shared".
 - **Purpose:** App functionality (and, for location, only live group position
   sharing). Never for advertising, analytics, or personalisation.
@@ -93,8 +97,8 @@ For every "collected" row:
 > the position keep updating while the screen is off.
 >
 > While background location is active, a persistent foreground-service notification
-> is always shown, so the user can see that tracking is running. Tracking stops if
-> the user revokes the permission or leaves the group.
+> is always shown, so the user can see that tracking is running and stop it with one
+> tap. Tracking stops if the user revokes the permission or leaves the group.
 
 ### What happens if the user does not grant location permission?
 
@@ -108,8 +112,13 @@ For every "collected" row:
   only on a user-initiated action, never on first launch.
 - The disclosure text is shown on screen before the OS permission dialog, and the
   demo video captures both in sequence.
+- On Android 11+ the background grant is a settings trip, not a dialog. The app
+  detects the missing grant and sends the user to the app's permission page rather
+  than silently failing.
 - The app displays a persistent notification for the entire duration that background
   location is active, and stopping it is a single in-app action.
+- `POST_NOTIFICATIONS` is requested before background sharing is enabled, because a
+  suppressed notification would violate the "user must always see it" requirement.
 
 ---
 
@@ -129,17 +138,23 @@ For every "collected" row:
 ### Permissions declared
 
 ```
+android.permission.INTERNET
 android.permission.ACCESS_FINE_LOCATION
 android.permission.ACCESS_COARSE_LOCATION
 android.permission.ACCESS_BACKGROUND_LOCATION
 android.permission.FOREGROUND_SERVICE
 android.permission.FOREGROUND_SERVICE_LOCATION
 android.permission.POST_NOTIFICATIONS
-android.permission.CAMERA
 ```
 
 `POST_NOTIFICATIONS` is required on Android 13+ for the foreground-service
 notification to be visible, which the location policy requires.
+
+`RECEIVE_BOOT_COMPLETED` and `WAKE_LOCK` appear in the merged manifest because
+`tauri-plugin-notification` declares them. The app does not register a boot receiver
+and does not start tracking on boot.
+
+There is **no** `CAMERA` permission: the app has no camera feature.
 
 ---
 
@@ -151,9 +166,9 @@ these are implemented:
 | Requirement | Implementation |
 |---|---|
 | Terms accepted before use | Un-dismissable first-launch gate prohibiting illegal content, harassment, and copyright infringement. The user must scroll the terms and explicitly accept. |
-| Report objectionable content | Any member can report a message. The report is encrypted and posted to the group, and the group's creator can delete the offending message. |
+| Report objectionable content | Any member can report a message. The report is encrypted and published to the group, and the group's creator can act on it. |
 | Block a user | Blocking is local and immediate: the blocked member's messages, files, and map pin disappear at once. Nothing is transmitted, so the blocked person is not notified. |
-| Delete content | Group creators can delete individual messages. Any member can delete their own entry by leaving the group. |
+| Delete content | Any member can retract their own events. Leaving the group removes the member's entry. |
 | Contact the developer | The Play listing contact address is used for enforcement escalation. |
 
 ---
@@ -165,13 +180,8 @@ these are implemented:
 | `ACCESS_FINE_LOCATION` | Location permissions form | Yes, §2 |
 | `ACCESS_BACKGROUND_LOCATION` | Location permissions form + video | Yes, §2 and the video script |
 | `FOREGROUND_SERVICE_LOCATION` | Foreground service declaration | Yes, §3 |
-| `CAMERA` | **Not needed** — see note | — |
-
-**Note on `CAMERA`:** it is declared only to let a user scan a QR invite. If the
-release does not ship QR scanning, remove `android.permission.CAMERA` from the
-manifest, the `uses-feature` entry, and the corresponding row in the Play listing.
-A camera permission with no visibly related feature is a common cause of review
-rejection.
+| `POST_NOTIFICATIONS` | None (runtime permission) | Yes, §3 |
+| `CAMERA` | **Not declared** — the app has no camera feature | — |
 
 ---
 
@@ -199,8 +209,8 @@ rejection.
 >
 > Everything is encrypted on your device before it is stored. Your position,
 > messages, and shared files are sealed with XChaCha20-Poly1305 and signed with
-> Ed25519, so the storage provider holds only unreadable ciphertext. Nobody other
-> than your group members — not the storage provider, not us — can read any of it.
+> Ed25519, so the relays that hold them see only unreadable ciphertext. Nobody other
+> than your group members — not the relay operators, not us — can read any of it.
 >
 > HOW IT WORKS
 > • One person creates a group and shares a single invite string with the members.
@@ -216,13 +226,15 @@ rejection.
 > WHAT YOU CONTROL
 > • An un-dismissable disclosure explains exactly what location sharing does before
 >   you ever see a permission prompt.
+> • Background sharing is opt-in, shows a permanent notification, and stops with one
+>   tap.
 > • Block any member instantly and locally; they are never told.
-> • Report a message; group creators can delete it.
-> • Leave the group and every key and token is erased from your device.
-> • Create a group and you can delete the entire group's data for everyone.
+> • Report a message; group creators can act on it.
+> • Leave the group and every key is erased from your device.
+> • Create a group and you can close it for everyone.
 >
 > PRIVACY
-> No analytics. No advertising. No third-party SDKs. The app talks to exactly one
-> external service, and it sees only ciphertext.
+> No analytics. No advertising. No third-party SDKs. The app talks only to the Nostr
+> relays and file servers named in your group's invite, and they see only ciphertext.
 >
-> Requires a private data store, which group creators set up once.
+> Full privacy policy: https://jaredch.github.io/shadow720-legal/PRIVACY.md

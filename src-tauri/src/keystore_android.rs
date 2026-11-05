@@ -247,6 +247,39 @@ impl<R: Runtime> LocationServiceHandle<R> {
             .unwrap_or(false)
     }
 
+    /// True when the app holds the background location grant.
+    ///
+    /// On Android 11+ this cannot be requested with a dialog: the user has to pick
+    /// "Allow all the time" on a settings screen. Reporting it separately lets the
+    /// UI offer that trip instead of silently failing to publish while the app is
+    /// closed.
+    pub fn has_background_location(&self) -> bool {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Response {
+            granted: bool,
+        }
+
+        self.handle
+            .run_mobile_plugin::<Response>("hasBackgroundLocation", serde_json::json!({}))
+            .map(|response| response.granted)
+            .unwrap_or(false)
+    }
+
+    /// True when the app holds fine or coarse location.
+    pub fn has_foreground_location(&self) -> bool {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Response {
+            granted: bool,
+        }
+
+        self.handle
+            .run_mobile_plugin::<Response>("hasForegroundLocation", serde_json::json!({}))
+            .map(|response| response.granted)
+            .unwrap_or(false)
+    }
+
     /// Battery percentage and charging state, or `None` when unavailable.
     ///
     /// `pct` of `-1` from the platform means "not reported", which is mapped to

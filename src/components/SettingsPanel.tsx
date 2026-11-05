@@ -8,6 +8,7 @@ import type {
 } from "../lib/api";
 import { describeError } from "../lib/api";
 import { formatBytes, relativeAge, shortKey } from "../lib/format";
+import { openExternal, PRIVACY_POLICY_URL, TERMS_URL } from "../lib/legal";
 import { ConfirmSheet, CopyButton, Field, Modal } from "./Modal";
 
 interface SettingsPanelProps {
@@ -422,6 +423,32 @@ export function SettingsPanel({
               </p>
             </>
           ) : null}
+        </section>
+
+        {/* -- Legal -- */}
+        <section className="card space-y-2">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+            About
+          </h3>
+          <p className="text-xs text-slate-500">
+            Shadow720 is serverless and end-to-end encrypted. There is no account and
+            no server operated by the developer: the app talks directly to public Nostr
+            relays, which store only encrypted data.
+          </p>
+          <button
+            type="button"
+            className="btn-secondary w-full text-xs"
+            onClick={() => void openExternal(PRIVACY_POLICY_URL)}
+          >
+            Privacy policy
+          </button>
+          <button
+            type="button"
+            className="btn-secondary w-full text-xs"
+            onClick={() => void openExternal(TERMS_URL)}
+          >
+            Terms of use
+          </button>
         </section>
       </div>
 

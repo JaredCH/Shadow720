@@ -207,6 +207,47 @@ export async function requestLocationPermission(): Promise<boolean> {
   }
 }
 
+/**
+ * Ask for the notification permission.
+ *
+ * Android 13+ suppresses the foreground-service notification without it, and the
+ * location policy requires that the user can always see background sharing is
+ * running. Returns `true` when notifications can be posted, including on platforms
+ * where the permission does not exist.
+ */
+export async function requestNotificationPermission(): Promise<boolean> {
+  const internals = (globalThis as { __TAURI_INTERNALS__?: unknown })
+    .__TAURI_INTERNALS__;
+  if (!internals || !(await isAndroid())) return true;
+  try {
+    const module = await import("@tauri-apps/plugin-notification");
+    let granted = await module.isPermissionGranted();
+    if (!granted) {
+      granted = (await module.requestPermission()) === "granted";
+    }
+    return granted;
+  } catch {
+    // No notification plugin: the platform does not gate the notification.
+    return true;
+  }
+}
+
+/**
+ * Whether the app holds the background location grant.
+ *
+ * On Android 11+ this cannot be granted with a dialog. The user has to choose
+ * "Allow all the time" on the app's permission page, so the UI offers that trip
+ * instead of a prompt that would silently do nothing.
+ */
+export async function hasBackgroundLocation(): Promise<boolean> {
+  try {
+    const access = await api.locationAccess();
+    return access.backgroundGranted;
+  } catch {
+    return false;
+  }
+}
+
 /** Read one position fix. */
 export async function currentPosition(): Promise<LocationResult> {
   const plugin = await loadPlugin();

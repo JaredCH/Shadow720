@@ -4239,6 +4239,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "hex",
+ "jni",
  "keyring",
  "log",
  "parking_lot",

@@ -28,14 +28,32 @@ import androidx.core.app.ServiceCompat
  *  - A persistent, non-dismissable notification for the entire time it runs.
  *  - `POST_NOTIFICATIONS` is declared so the notification can be shown on API 33+.
  *
+ * # Battery
+ *
+ * The service does not ask the platform for a fix on a fixed timer. It asks for a
+ * *distance* filter and lets the platform's own sensor fusion decide when a fix is
+ * worth delivering, then widens the interval when the device is still or the
+ * battery is low. A phone in a pocket therefore costs almost nothing, and a phone
+ * in a moving car updates every few seconds.
+ *
  * The service deliberately does **not** touch encryption or the network. It only
- * produces location fixes and hands them to the Rust core, which keeps all
- * cryptography in one place.
+ * produces location fixes and hands them to the Rust core through
+ * [NativePublisher], which keeps all cryptography in one place and lets a fix
+ * publish with the app closed.
  */
 class LocationForegroundService : Service() {
 
     private lateinit var locationManager: android.location.LocationManager
     private var listener: android.location.LocationListener? = null
+
+    /** True once `startForeground` has succeeded, so teardown knows what to undo. */
+    private var foregroundStarted = false
+
+    /** Last fix handed to the core, used to widen the interval when still. */
+    private var lastFix: Location? = null
+
+    /** Current request interval, so a cadence change can be applied incrementally. */
+    private var currentIntervalMs = MOVING_INTERVAL_MS
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -55,24 +73,21 @@ class LocationForegroundService : Service() {
             }
             else -> startTracking()
         }
+        // START_STICKY so the system restarts the service after a low-memory kill.
+        // The user's preference is the source of truth, and the notification is
+        // re-raised on restart, so a restart never hides that sharing is running.
         return START_STICKY
     }
 
     private fun startTracking() {
         // `startForeground` must be called promptly after the service starts or the
         // system kills it, so the notification is raised before any location work.
-        val notification = buildNotification()
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            ServiceCompat.startForeground(
-                this,
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION,
-            )
-        } else {
-            @Suppress("DEPRECATION")
-            startForeground(NOTIFICATION_ID, notification)
+        if (!raiseForeground()) {
+            // Android 14+ throws when the location permission is missing, and a
+            // service that cannot show its notification must not run at all: the
+            // location policy requires the user to always see it.
+            stopSelf()
+            return
         }
 
         if (listener != null) return
@@ -80,7 +95,7 @@ class LocationForegroundService : Service() {
         val locationListener =
             object : android.location.LocationListener {
                 override fun onLocationChanged(location: Location) {
-                    publishFix(location)
+                    onFix(location)
                 }
 
                 // Required on older API levels; no-ops on new ones.
@@ -93,19 +108,62 @@ class LocationForegroundService : Service() {
             }
 
         listener = locationListener
+        requestUpdates(locationListener, MOVING_INTERVAL_MS)
+    }
 
+    /**
+     * Raise the ongoing notification.
+     *
+     * Returns `false` when the platform refused, which happens on Android 14+ if
+     * the location permission is not granted. Callers must stop the service rather
+     * than continue without a visible notification.
+     */
+    private fun raiseForeground(): Boolean {
+        val notification = buildNotification()
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                ServiceCompat.startForeground(
+                    this,
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION,
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                startForeground(NOTIFICATION_ID, notification)
+            }
+            foregroundStarted = true
+            true
+        } catch (error: SecurityException) {
+            // Location permission was revoked, or the FGS type is not allowed.
+            false
+        } catch (error: IllegalArgumentException) {
+            // The manifest is missing the FGS type declaration.
+            false
+        }
+    }
+
+    /**
+     * Ask the platform for fixes.
+     *
+     * `minDistanceM` is the real battery lever: with a distance filter the platform
+     * can keep the GPS chip idle until the device has actually moved, instead of
+     * waking it on a timer. `minTimeMs` is only a floor.
+     */
+    private fun requestUpdates(target: android.location.LocationListener, intervalMs: Long) {
+        currentIntervalMs = intervalMs
         try {
             locationManager.requestLocationUpdates(
                 android.location.LocationManager.GPS_PROVIDER,
-                MIN_TIME_MS,
+                intervalMs,
                 MIN_DISTANCE_M,
-                locationListener,
+                target,
             )
             locationManager.requestLocationUpdates(
                 android.location.LocationManager.NETWORK_PROVIDER,
-                MIN_TIME_MS,
+                intervalMs,
                 MIN_DISTANCE_M,
-                locationListener,
+                target,
             )
         } catch (error: SecurityException) {
             // The permission was revoked while the service was running. That is a
@@ -119,6 +177,73 @@ class LocationForegroundService : Service() {
         }
     }
 
+    /**
+     * Handle one fix: publish it, then adapt the cadence.
+     *
+     * The Rust core applies the authoritative 30 s / 15 m publish policy, so every
+     * fix is forwarded. What this method decides is how often the *platform* is
+     * asked, which is the part that costs battery.
+     */
+    private fun onFix(location: Location) {
+        val previous = lastFix
+        lastFix = location
+
+        NativePublisher.publishFix(
+            location.latitude,
+            location.longitude,
+            location.accuracy,
+            location.time,
+            if (location.hasSpeed()) location.speed else -1f,
+            if (location.hasBearing()) location.bearing else -1f,
+            batteryPercent(),
+            isCharging(),
+        )
+
+        // Also broadcast so an open webview can update its own pin immediately
+        // rather than waiting for the next roster poll.
+        broadcastFix(location)
+
+        val nextInterval = chooseInterval(location, previous)
+        if (nextInterval != currentIntervalMs) {
+            listener?.let { active ->
+                try {
+                    locationManager.removeUpdates(active)
+                } catch (error: SecurityException) {
+                    // Nothing to clean up if permission is already gone.
+                }
+                requestUpdates(active, nextInterval)
+            }
+        }
+    }
+
+    /**
+     * Pick the next request interval.
+     *
+     * Three inputs, in order of importance:
+     *
+     * 1. **Battery.** Below [LOW_BATTERY_PCT] and not charging, everything slows
+     *    down. A member whose phone is about to die is better served by a stale pin
+     *    than by a dead phone.
+     * 2. **Movement.** A device that has not moved is not worth a GPS wake-up, so
+     *    the interval widens to the heartbeat. This is what makes a phone on a desk
+     *    cost almost nothing.
+     * 3. **Speed.** A fast-moving device gets the tightest interval, because that is
+     *    when a stale pin is most misleading.
+     */
+    private fun chooseInterval(location: Location, previous: Location?): Long {
+        val battery = batteryPercent()
+        val charging = isCharging()
+        if (!charging && battery in 0..LOW_BATTERY_PCT) {
+            return LOW_BATTERY_INTERVAL_MS
+        }
+
+        val moved = previous == null || previous.distanceTo(location) >= STILL_RADIUS_M
+        if (!moved) return STILL_INTERVAL_MS
+
+        val speed = if (location.hasSpeed()) location.speed else 0f
+        return if (speed >= FAST_SPEED_MPS) FAST_INTERVAL_MS else MOVING_INTERVAL_MS
+    }
+
     private fun stopTracking() {
         listener?.let { active ->
             try {
@@ -128,28 +253,27 @@ class LocationForegroundService : Service() {
             }
         }
         listener = null
-        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        lastFix = null
+        if (foregroundStarted) {
+            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+            foregroundStarted = false
+        }
     }
 
     /**
-     * Hand a fix to the Rust core.
+     * Mirror the fix to an open webview.
      *
-     * The core owns the movement gate and the publish cadence, so every fix is
-     * forwarded and the core decides whether it is worth a request. That keeps the
-     * "15 m and 30 s" policy in exactly one place.
-     *
-     * The fix is delivered as an ordered broadcast so the webview side can pick it
-     * up without this service needing a reference to the Tauri runtime.
+     * Best-effort: with the app closed nothing receives it, which is exactly why
+     * [NativePublisher] exists. This is only for the case where the UI is on screen
+     * and wants to move the pin without waiting for a poll.
      */
-    private fun publishFix(location: Location) {
+    private fun broadcastFix(location: Location) {
         val intent = Intent(ACTION_FIX).apply {
             setPackage(packageName)
             putExtra(EXTRA_LAT, location.latitude)
             putExtra(EXTRA_LON, location.longitude)
             putExtra(EXTRA_ACCURACY, location.accuracy)
             putExtra(EXTRA_TIME_MS, location.time)
-            // Speed and heading come from the platform's own sensor fusion, which
-            // is far less noisy than differencing two positions 30 seconds apart.
             putExtra(EXTRA_SPEED, if (location.hasSpeed()) location.speed else -1f)
             putExtra(EXTRA_HEADING, if (location.hasBearing()) location.bearing else -1f)
             putExtra(EXTRA_BATTERY, batteryPercent())
@@ -232,6 +356,19 @@ class LocationForegroundService : Service() {
             .build()
     }
 
+    /**
+     * The user swiped the app out of recents.
+     *
+     * Background sharing is an explicit, notified choice, so it keeps running: the
+     * whole point is that the pin keeps moving while the app is closed. The
+     * notification is the control surface, and it stays visible.
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // Nothing to do: START_STICKY plus the ongoing notification is the correct
+        // behaviour. Overriding this only to call `super` documents the intent.
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
         stopTracking()
         super.onDestroy()
@@ -244,7 +381,7 @@ class LocationForegroundService : Service() {
         /** Stop background location sharing. */
         const val ACTION_STOP = "com.shadow720.app.action.STOP_LOCATION"
 
-        /** Broadcast delivered for each accepted fix. */
+        /** Broadcast delivered for each accepted fix, for an open webview. */
         const val ACTION_FIX = "com.shadow720.app.action.LOCATION_FIX"
 
         const val EXTRA_LAT = "lat"
@@ -260,19 +397,38 @@ class LocationForegroundService : Service() {
         private const val NOTIFICATION_ID = 7201
 
         /**
-         * Request interval floor. The Rust core applies the real 30 s / 15 m policy;
-         * asking Android for fixes a little more often than that keeps the gate fed
-         * without wasting battery on every GPS sample.
+         * Distance filter. This is the real battery lever: the platform keeps the
+         * GPS chip idle until the device has actually moved this far, instead of
+         * waking it on a timer.
          */
-        private const val MIN_TIME_MS = 20_000L
-        private const val MIN_DISTANCE_M = 10f
+        private const val MIN_DISTANCE_M = 15f
+
+        /** Interval while moving at a normal pace. */
+        private const val MOVING_INTERVAL_MS = 30_000L
+
+        /** Interval while moving fast, where a stale pin is most misleading. */
+        private const val FAST_INTERVAL_MS = 10_000L
+
+        /** Interval while stationary: a heartbeat, so peers see the device is alive. */
+        private const val STILL_INTERVAL_MS = 120_000L
+
+        /** Interval when the battery is low and the device is not charging. */
+        private const val LOW_BATTERY_INTERVAL_MS = 300_000L
+
+        /** Below this percentage, cadence drops to the low-battery interval. */
+        private const val LOW_BATTERY_PCT = 15
+
+        /** Movement below this radius counts as stationary. */
+        private const val STILL_RADIUS_M = 15f
+
+        /** Above this speed the device is treated as driving. */
+        private const val FAST_SPEED_MPS = 8f
 
         /** True when the user has granted the notification permission, if needed. */
         fun canPostNotifications(context: Context): Boolean {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return true
             return NotificationManagerCompat.from(context).areNotificationsEnabled()
         }
-
         /** Start the service from an activity or the webview bridge. */
         fun start(context: Context) {
             val intent = Intent(context, LocationForegroundService::class.java)

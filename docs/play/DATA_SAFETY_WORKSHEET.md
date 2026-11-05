@@ -7,6 +7,9 @@ wording changes between console versions.
 Companion documents: [PRIVACY_POLICY.md](./PRIVACY_POLICY.md) ·
 [PLAY_CONSOLE_ANSWERS.md](./PLAY_CONSOLE_ANSWERS.md)
 
+The canonical public privacy policy is
+<https://jaredch.github.io/shadow720-legal/PRIVACY.md>.
+
 ---
 
 ## Section 1 — Data collection and security
@@ -14,7 +17,7 @@ Companion documents: [PRIVACY_POLICY.md](./PRIVACY_POLICY.md) ·
 | Console question | Answer | Why |
 |---|---|---|
 | Does your app collect or share any of the required user data types? | **Yes** | Location, messages, files, and a display name are collected. |
-| Is all of the user data collected by your app encrypted in transit? | **Yes** | Sealed with `XChaCha20-Poly1305` on-device *before* transmission, then sent over HTTPS. |
+| Is all of the user data collected by your app encrypted in transit? | **Yes** | Sealed with `XChaCha20-Poly1305` on-device *before* transmission, then sent over WSS/HTTPS. |
 | Does your app provide a way for users to request their data be deleted? | **Yes** | "Leave group and wipe my data"; group creators additionally get "Destroy group". |
 | Do you have an independent security review? | **No** | Not performed. |
 | Do you commit to Play Families policy? | **Yes** | The app is not directed at children. |
@@ -48,19 +51,20 @@ purpose, optionality, and sharing.
 ### Why "shared" is No for every row
 
 Play counts data as *shared* when it is transferred to a third party. Here the only
-external service is GitHub, and it receives ciphertext it cannot decrypt, cannot
-interpret, and cannot correlate to a person. Under Play's definition this is not
-sharing: the data is not made available to a third party in usable form.
+external services are the Nostr relays and Blossom file servers named in the group's
+invite, and they receive ciphertext they cannot decrypt, cannot interpret, and cannot
+correlate to a person. Under Play's definition this is not sharing: the data is not
+made available to a third party in usable form.
 
 This is worth being able to defend, so the supporting facts are:
 
 - Payloads are encrypted with a group key that exists only on members' devices.
-- GitHub's API receives an opaque Base64 blob in a comment body, or an opaque blob
-  as a release asset.
+- A relay receives an opaque signed event whose `content` is a Base64 ciphertext.
+- A Blossom server receives an opaque blob whose name is its SHA-256.
 - No analytics, advertising, crash-reporting, or social SDK is linked into the app
   (`src-tauri/Cargo.toml` and `package.json` are the full dependency list).
-- The only outbound hosts are `api.github.com`, `uploads.github.com`, and the asset
-  download host GitHub redirects to. Both are in the Tauri content-security policy.
+- The only outbound hosts are the relays and Blossom servers in the invite, plus the
+  OpenStreetMap tile server for the map. All are in the Tauri content-security policy.
 
 ---
 
@@ -74,13 +78,14 @@ This is worth being able to defend, so the supporting facts are:
 | `FOREGROUND_SERVICE` | Yes | Foreground service declaration |
 | `FOREGROUND_SERVICE_LOCATION` | Yes | Foreground service declaration |
 | `POST_NOTIFICATIONS` | Yes | No separate form |
-| `CAMERA` | Yes, only if QR scanning ships | Consider removing — see below |
+| `CAMERA` | **No** | — |
 
-> **Decision point:** `CAMERA` exists solely to scan a QR invite. Google flags
-> permissions that do not obviously map to a described feature. If the first release
-> uses copy/paste invites only, delete the permission from the Android manifest and
-> from this table. Two permissions (camera and background location) in a first
-> release is avoidable review risk.
+`CAMERA` was removed: the app has no camera feature, and a permission that does not
+map to a described feature is a common cause of review rejection.
+
+`RECEIVE_BOOT_COMPLETED` and `WAKE_LOCK` appear in the merged manifest because
+`tauri-plugin-notification` declares them. The app registers no boot receiver and
+does not start tracking on boot.
 
 ---
 
@@ -102,17 +107,21 @@ rather than opportunistically.
 
 ## Section 5 — Pre-submission checklist
 
-- [ ] Privacy policy URL is public and reachable without sign-in.
-- [ ] The URL in the Play listing matches [PRIVACY_POLICY.md](./PRIVACY_POLICY.md).
-- [ ] Ballot placeholders in the privacy policy are filled in: contact address and
-      legal provider.
+- [x] Privacy policy URL is public and reachable without sign-in:
+      <https://jaredch.github.io/shadow720-legal/PRIVACY.md>
+- [x] The URL in the Play listing matches the published policy.
+- [x] The policy has a real contact address and provider, not placeholders.
+- [x] The privacy policy is linked from inside the app (Settings → About, and both
+      consent-gate stages).
 - [ ] Demo video is uploaded and its URL is entered in the location declaration.
 - [ ] The disclosure wording in the shipped build matches
       [PLAY_CONSOLE_ANSWERS.md](./PLAY_CONSOLE_ANSWERS.md) §2 and the video.
 - [ ] Terms and disclosure gates are reachable on a **fresh install**.
 - [ ] The persistent foreground-service notification is present whenever background
       location is active.
-- [ ] `CAMERA` is either removed from the manifest or has a shipped QR-scan feature.
+- [x] `CAMERA` is removed from the manifest.
 - [ ] The app collects nothing before the consent gates are cleared (verify by
       watching network traffic on a fresh install with no group joined).
-- [ ] A `targetSdk` of 35 or newer is in the release build.
+- [x] A `targetSdk` of 35 or newer is in the release build (36).
+- [x] The release artifact is a signed `.aab`, not an APK.
+- [x] `versionCode` in the bundle is greater than the last uploaded one.

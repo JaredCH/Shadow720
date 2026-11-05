@@ -433,6 +433,22 @@ export interface LocationAccessResponse {
   systemLocationEnabled: boolean;
   /** True when this platform can open a settings screen for the user. */
   canOpenSettings: boolean;
+  /** True when the app holds fine or coarse location. */
+  foregroundGranted: boolean;
+  /**
+   * True when the app holds the background location grant.
+   *
+   * On Android 11+ this is a separate settings action, not a dialog, so the UI has
+   * to offer that trip rather than a prompt.
+   */
+  backgroundGranted: boolean;
+  /**
+   * True when the foreground-service notification can be shown.
+   *
+   * The location policy requires the user to always see that background sharing is
+   * running, so a denied notification permission blocks background sharing.
+   */
+  notificationsGranted: boolean;
 }
 
 /**

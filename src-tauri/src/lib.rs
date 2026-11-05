@@ -52,6 +52,8 @@ pub mod vault;
 pub mod wire;
 
 #[cfg(target_os = "android")]
+pub mod android_bridge;
+#[cfg(target_os = "android")]
 pub mod keystore_android;
 
 pub use error::{AppError, AppErrorKind, Result};
@@ -159,6 +161,15 @@ pub fn run() {
 
     let result = builder
         .manage(commands::AppState::new())
+        .setup(|app| {
+            // The location foreground service outlives the webview, so it calls
+            // into the core through JNI rather than through JavaScript. That entry
+            // point has no `AppHandle` of its own, so one is captured here.
+            #[cfg(target_os = "android")]
+            android_bridge::install(app.handle().clone());
+            let _ = app;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::unlock_vault,
             commands::reset_vault,

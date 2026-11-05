@@ -11,12 +11,14 @@ import { describeError } from "./lib/api";
 import {
   currentPosition,
   describeLocationFailure,
+  hasBackgroundLocation,
   locationPermissionState,
   locationRemedy,
   locationRemedyLabel,
   openLocationRemedy,
   readBattery,
   requestLocationPermission,
+  requestNotificationPermission,
 } from "./lib/location";
 import type { LocationFailure, LocationRemedy } from "./lib/location";
 import { ChatDrawer, readFileBytes, saveDecryptedFile } from "./components/ChatDrawer";
@@ -749,29 +751,57 @@ export default function App() {
       : `Notice accepted by ${result.acceptedRelays.join(", ")}.${unconfirmed}`} Other copies may remain.`;
   };
 
-    const handleToggleBackground = async () => {
-      const next = !backgroundEnabled;
-      try {
-        const response = await api.setBackgroundLocation(next);
-        setBackgroundEnabled(response.enabled);
-        if (response.warning) {
-          setBanner({ kind: "not_configured", message: response.warning });
-        }
-        if (next) {
-          // Background sharing only makes sense with a granted permission; ask now
-          // rather than letting the service fail silently.
-          const granted = await requestLocationPermission();
-          if (!granted) {
-            const state = await locationPermissionState();
-            showLocationFailure(
-              state === "system-disabled" ? "system-disabled" : "permission-denied",
-            );
-          }
-        }
-      } catch (thrown) {
-        setBanner(api.toAppError(thrown));
+  const handleToggleBackground = async () => {
+    const next = !backgroundEnabled;
+
+    if (next) {
+      // Order matters, and Play checks it: the in-app disclosure is already
+      // acknowledged by the time this runs, then the foreground grant, then the
+      // notification permission the foreground service needs to be visible, and
+      // only then the background grant — which on Android 11+ is a settings trip,
+      // not a dialog.
+      const foreground = await requestLocationPermission();
+      if (!foreground) {
+        const state = await locationPermissionState();
+        showLocationFailure(
+          state === "system-disabled" ? "system-disabled" : "permission-denied",
+        );
+        return;
       }
-    };
+
+      const notifications = await requestNotificationPermission();
+      if (!notifications) {
+        setBanner({
+          kind: "not_configured",
+          message:
+            "Notifications are off, so Android would hide the notice that your position is being shared. Turn notifications on for Shadow720, then try again.",
+        });
+        return;
+      }
+
+      const background = await hasBackgroundLocation();
+      if (!background) {
+        setBanner({
+          kind: "not_configured",
+          message:
+            "Android needs \"Allow all the time\" for location before sharing can continue with the app closed. Open Settings, choose Permissions → Location, and pick Allow all the time.",
+        });
+        // The settings page is where the grant lives; there is no dialog for it.
+        await openLocationRemedy("app-settings");
+        return;
+      }
+    }
+
+    try {
+      const response = await api.setBackgroundLocation(next);
+      setBackgroundEnabled(response.enabled);
+      if (response.warning) {
+        setBanner({ kind: "not_configured", message: response.warning });
+      }
+    } catch (thrown) {
+      setBanner(api.toAppError(thrown));
+    }
+  };
 
   const handleLeave = async () => {
     await api.leaveAndWipe();

@@ -23,22 +23,22 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' data: blob: https://tile.openstreetmap.org https://*.tile.openstreetmap.org; connect-src 'self' ipc: http://ipc.localhost https://api.github.com https://uploads.github.com https://objects.githubusercontent.com https://github.com https://codeload.github.com https://tile.openstreetmap.org https://*.tile.openstreetmap.org; style-src 'self' 'unsafe-inline'; script-src 'self'; worker-src 'self' blob:; font-src 'self' data:; child-src 'self' blob:"
+      "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' data: blob: https://tile.openstreetmap.org https://*.tile.openstreetmap.org; connect-src 'self' ipc: http://ipc.localhost wss: https://tile.openstreetmap.org https://*.tile.openstreetmap.org; style-src 'self' 'unsafe-inline'; script-src 'self'; worker-src 'self' blob:; font-src 'self' data:; child-src 'self' blob:"
     }
   },
   "bundle": {
-      "active": true,
-      "icon": [
+    "active": true,
+    "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/icon.ico"
     ],
     "android": {
       "minSdkVersion": 26,
-      "versionCode": 6
+      "versionCode": 7
     },
     "shortDescription": "E2EE group location and chat, no server",
-    "longDescription": "A serverless end-to-end encrypted group app. Location, chat, and file sharing are encrypted on-device with XChaCha20-Poly1305 and Ed25519 before being stored. GitHub is used only as an untrusted ciphertext store."
+    "longDescription": "A serverless end-to-end encrypted group app. Location, chat, and file sharing are encrypted on-device with XChaCha20-Poly1305 and Ed25519 before being stored. Public Nostr relays are used only as an untrusted ciphertext store."
   },
   "plugins": {}
 }

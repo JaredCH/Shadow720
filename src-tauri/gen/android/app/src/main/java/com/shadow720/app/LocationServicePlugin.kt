@@ -12,22 +12,24 @@ package com.shadow720.app
  * one thing the app is declared to do.
  */
 
+import android.Manifest
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.location.LocationManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
-import org.json.JSONObject
 
 @InvokeArg
 class SetLocationSharingArgs {
@@ -40,9 +42,10 @@ class LocationServicePlugin(private val activity: android.app.Activity) : Plugin
     /**
      * Receives fixes from the foreground service and forwards them to the webview.
      *
-     * Without this the service produced fixes that nothing consumed, so background
-     * sharing looked enabled while the pin never moved. The receiver is registered
-     * for the lifetime of the plugin, which is the lifetime of the app process.
+     * The service publishes to the Rust core directly, so this is only for the case
+     * where the UI is on screen and wants to move the pin without waiting for a
+     * roster poll. It is registered for the lifetime of the plugin, which is the
+     * lifetime of the app process.
      */
     private val fixReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -106,6 +109,46 @@ class LocationServicePlugin(private val activity: android.app.Activity) : Plugin
     }
 
     /**
+     * Whether the app holds the background location grant.
+     *
+     * On Android 11+ this cannot be requested with a dialog: the user has to pick
+     * "Allow all the time" on a settings screen. Reporting it separately lets the UI
+     * offer that trip instead of silently failing to publish while the app is
+     * closed.
+     */
+    @Command
+    fun hasBackgroundLocation(invoke: Invoke) {
+        val granted = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            // Before Android 10 there is no separate background grant.
+            hasForegroundLocation()
+        } else {
+            ContextCompat.checkSelfPermission(
+                activity,
+                Manifest.permission.ACCESS_BACKGROUND_LOCATION,
+            ) == PackageManager.PERMISSION_GRANTED
+        }
+        invoke.resolve(JSObject().put("granted", granted))
+    }
+
+    /** Whether the app holds fine or coarse location. */
+    @Command
+    fun hasForegroundLocation(invoke: Invoke) {
+        invoke.resolve(JSObject().put("granted", hasForegroundLocation()))
+    }
+
+    private fun hasForegroundLocation(): Boolean {
+        val fine = ContextCompat.checkSelfPermission(
+            activity,
+            Manifest.permission.ACCESS_FINE_LOCATION,
+        ) == PackageManager.PERMISSION_GRANTED
+        val coarse = ContextCompat.checkSelfPermission(
+            activity,
+            Manifest.permission.ACCESS_COARSE_LOCATION,
+        ) == PackageManager.PERMISSION_GRANTED
+        return fine || coarse
+    }
+
+    /**
      * Whether the device-wide location switch is on.
      *
      * A granted runtime permission is not enough: with the system toggle off every
@@ -158,7 +201,8 @@ class LocationServicePlugin(private val activity: android.app.Activity) : Plugin
      *
      * Android has no API to grant a permission on the user's behalf, so the app can
      * only take them to the right screen. `app` opens this app's own permission
-     * page, which is where a permanently denied permission is re-enabled.
+     * page, which is where a permanently denied permission is re-enabled and where
+     * "Allow all the time" is chosen.
      */
     @Command
     fun openLocationSettings(invoke: Invoke) {

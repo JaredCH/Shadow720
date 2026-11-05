@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { AppError } from "../lib/api";
 import { describeError } from "../lib/api";
+import { openExternal, PRIVACY_POLICY_URL, TERMS_URL } from "../lib/legal";
 import { CopyButton, Field, Modal } from "./Modal";
 
 /**
@@ -101,6 +102,25 @@ export function ConsentGate({
             Accepting is required to use the app. You can leave the group and erase
             your data at any time from Settings.
           </p>
+          <p className="text-slate-500">
+            Read the full{" "}
+            <button
+              type="button"
+              className="text-accent underline"
+              onClick={() => void openExternal(TERMS_URL)}
+            >
+              terms of use
+            </button>{" "}
+            and{" "}
+            <button
+              type="button"
+              className="text-accent underline"
+              onClick={() => void openExternal(PRIVACY_POLICY_URL)}
+            >
+              privacy policy
+            </button>
+            .
+          </p>
         </div>
       </Modal>
     );
@@ -120,6 +140,17 @@ export function ConsentGate({
           <li>Tracking continues while the app is in the background, if you enable it.</li>
           <li>You can turn location sharing off at any time.</li>
         </ul>
+        <p className="text-xs text-slate-500">
+          Full details are in the{" "}
+          <button
+            type="button"
+            className="text-accent underline"
+            onClick={() => void openExternal(PRIVACY_POLICY_URL)}
+          >
+            privacy policy
+          </button>
+          .
+        </p>
       </Modal>
     );
   }

@@ -397,9 +397,21 @@ pub struct LocationAccessResponse {
     pub system_location_enabled: bool,
     /// True when this platform can open a settings screen for the user.
     pub can_open_settings: bool,
+    /// True when the app holds fine or coarse location.
+    pub foreground_granted: bool,
+    /// True when the app holds the background location grant.
+    ///
+    /// On Android 11+ this is a separate settings action, not a dialog, so the UI
+    /// has to offer that trip rather than a prompt.
+    pub background_granted: bool,
+    /// True when the foreground-service notification can be shown.
+    ///
+    /// The location policy requires the user to always see that background sharing
+    /// is running, so a denied notification permission blocks background sharing.
+    pub notifications_granted: bool,
 }
 
-/// Report whether the device location switch is on.
+/// Report whether the device location switch is on and which grants are held.
 ///
 /// The runtime permission is checked in the webview, which owns the plugin call;
 /// this covers the other half of the problem, where the permission is granted but
@@ -413,13 +425,22 @@ pub fn location_access(app: tauri::AppHandle) -> Result<LocationAccessResponse> 
         let handle = app
             .try_state::<crate::keystore_android::LocationServiceHandle<tauri::Wry>>();
         return Ok(match handle {
-            Some(handle) => LocationAccessResponse {
-                system_location_enabled: handle.inner().is_system_location_enabled(),
-                can_open_settings: true,
-            },
+            Some(handle) => {
+                let inner = handle.inner();
+                LocationAccessResponse {
+                    system_location_enabled: inner.is_system_location_enabled(),
+                    can_open_settings: true,
+                    foreground_granted: inner.has_foreground_location(),
+                    background_granted: inner.has_background_location(),
+                    notifications_granted: inner.can_post_notifications(),
+                }
+            }
             None => LocationAccessResponse {
                 system_location_enabled: false,
                 can_open_settings: false,
+                foreground_granted: false,
+                background_granted: false,
+                notifications_granted: false,
             },
         });
     }
@@ -432,6 +453,9 @@ pub fn location_access(app: tauri::AppHandle) -> Result<LocationAccessResponse> 
         Ok(LocationAccessResponse {
             system_location_enabled: true,
             can_open_settings: cfg!(windows),
+            foreground_granted: true,
+            background_granted: false,
+            notifications_granted: true,
         })
     }
 }
@@ -1161,6 +1185,19 @@ pub async fn join_group(
 #[tauri::command]
 pub async fn update_location(
     state: State<'_, AppState>,
+    update: LocationUpdate,
+) -> Result<LocationUpdateResponse> {
+    publish_fix(&state, update).await
+}
+
+/// Apply the movement gate and publish a fix.
+///
+/// Split out of the command so the background publisher can drive the same path
+/// without a webview: the gate, the envelope, and the relay write must not exist
+/// in two places, or a fix published while the app is closed would bypass the
+/// battery policy.
+pub(crate) async fn publish_fix(
+    state: &AppState,
     update: LocationUpdate,
 ) -> Result<LocationUpdateResponse> {
     let group_state = state.group()?;
