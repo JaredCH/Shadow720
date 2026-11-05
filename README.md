@@ -60,7 +60,15 @@ The difference is what it *doesn't* have.
 
 There is nothing to host, so there is nothing to pay for. The storage is free-tier infrastructure that already exists: public Nostr relays and Blossom blob servers. The app is MIT-licensed and the whole thing runs on your hardware.
 
-### What's new in 0.1.8
+### What's new in 0.1.9
+
+- **Positions survive a lost connection.** A fix that cannot reach a relay is no longer thrown away. It is sealed into an on-device outbox and published automatically when the connection returns, so a tunnel, a flight, or a dead Wi-Fi network no longer leaves the group looking at a stale pin.
+- **The offline stretch is in your history.** Cached fixes are also written to the local track log as they are captured, so the map's history view shows where you actually went instead of drawing a straight line across the gap.
+- **You can see that sharing is deferred.** A banner reports how many positions are cached and offers a retry, and the settings panel shows the same count. A queued fix is not an error, so it no longer raises one.
+- **The cache is bounded and encrypted.** At most 512 fixes, nothing older than 24 hours, sealed with the group key beside the vault, and dropped when the vault is wiped. A device left offline for a week cannot grow it without bound.
+- **The displayed build version is correct again.** `APP_VERSION` had been left at `0.1.7` through the 0.1.8 release, so a bug report quoted the wrong build. The bump script now updates and verifies it like every other declaration.
+
+### What's new in 0.1.9
 
 - **Tap a name to fly there.** Selecting a member in the roster centres and zooms the map on them, and turns off "Following you" so the view stays put.
 - **A month of history.** Every device keeps a 31-day track log, grouped by day and week, with distance, dominant activity, and lowest battery per day. It is sealed with the group key and never published.
@@ -109,13 +117,13 @@ The Android APK is signed with a self-signed key, so Android will ask you to all
 
 ```bash
 # Debian / Ubuntu / Mint
-sudo apt install ./Shadow720_0.1.8_amd64.deb
+sudo apt install ./Shadow720_0.1.9_amd64.deb
 
 # Fedora / RHEL / Rocky / Alma
-sudo dnf install ./Shadow720-0.1.8-1.x86_64.rpm
+sudo dnf install ./Shadow720-0.1.9-1.x86_64.rpm
 
 # Any distro, no install
-chmod +x Shadow720_0.1.8_amd64.AppImage && ./Shadow720_0.1.8_amd64.AppImage
+chmod +x Shadow720_0.1.9_amd64.AppImage && ./Shadow720_0.1.9_amd64.AppImage
 ```
 
 The Linux build needs WebKitGTK 4.1 (`libwebkit2gtk-4.1-0`), which the `.deb` and `.rpm` pull in automatically. The AppImage bundles it.
@@ -253,6 +261,19 @@ Each device keeps a **month-long track log** of every member it has seen. It is 
 The log is sealed with the group key and written beside the vault, so it is unreadable without both the device key and the group key. Blocking a member deletes their history, because keeping a month of someone's movements after blocking them would defeat the point.
 
 The map's history panel groups the log by day and by week, and shows each day's distance, dominant activity, and lowest battery.
+
+### Offline cache
+
+A fix that the movement gate decided was worth publishing can still fail to reach a relay. Rather than dropping it, the core seals it into an on-device outbox and replays it when a relay answers.
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `OUTBOX_MAX_POINTS` | 512 | most fixes kept while offline (~4 h at the 30 s floor) |
+| `OUTBOX_MAX_AGE_MS` | 24 h | older fixes are dropped rather than replayed |
+
+Only the **newest** cached fix is published on reconnect. A roster slot is an addressable Nostr event keyed by the member's pubkey, so republishing replaces it: replaying the whole backlog would cost one relay round-trip per point and still leave peers holding a single position. The intermediate points are already in the local track log, which is where they are useful.
+
+The queue is flushed on three signals, because no single one is sufficient: the browser's `online` event (fast, but Android does not fire it when a relay merely becomes reachable), a successful roster poll (the only proof a relay actually answers), and once at startup (a queue can survive a restart). The file is sealed with the group key, written beside the vault, and removed with it.
 
 ### Battery
 
@@ -528,6 +549,7 @@ Honest list. The app says these out loud rather than pretending otherwise.
 - **The map fetches OpenStreetMap tiles**, so the tile server sees the viewport coordinates being requested. Positions themselves stay encrypted; only the map area you are looking at is disclosed. The basemap follows the operating system's light or dark setting.
 - **Activity is inferred from reported speed**, not from a motion sensor. A device that reports no speed shows as stationary even while moving.
 - **Trails are local and short.** Each member's recent positions are kept in memory on this device only, capped at 60 points, and are not published or shared.
+- **The offline cache publishes only the newest fix.** Positions captured while offline are all kept locally and appear in the history view, but a reconnect sends just the latest one, because a roster slot is a single replaceable event. Peers see where you are, not the route you took to get there.
 - **Background location is unverified on hardware.** The foreground service, the JNI
   publish path, and the Keystore round trip are compiled and configured but have not
   been exercised on a physical device. Test on a real phone before submitting: a

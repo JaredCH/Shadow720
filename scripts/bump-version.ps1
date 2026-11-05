@@ -3,12 +3,13 @@
     Bump the app version in every file that declares it, safely.
 
 .DESCRIPTION
-    The version lives in four places and they must agree:
+    The version lives in five places and they must agree:
 
       * src-tauri/tauri.conf.json  - "version" and bundle.android.versionCode
       * package.json               - "version"
       * src-tauri/Cargo.toml       - [package] version
       * src-tauri/Cargo.lock       - the `shadow720` package entry only
+      * src/App.tsx                - the APP_VERSION constant the UI displays
 
     Two traps have already broken a build here, and this script exists to close
     both:
@@ -69,8 +70,9 @@ $packagePath = Join-Path $root 'package.json'
 $cargoPath = Join-Path $root 'src-tauri\Cargo.toml'
 $lockPath = Join-Path $root 'src-tauri\Cargo.lock'
 $readmePath = Join-Path $root 'README.md'
+$appPath = Join-Path $root 'src\App.tsx'
 
-foreach ($path in @($tauriPath, $packagePath, $cargoPath, $lockPath, $readmePath)) {
+foreach ($path in @($tauriPath, $packagePath, $cargoPath, $lockPath, $readmePath, $appPath)) {
     if (-not (Test-Path $path)) { throw "Expected file not found: $path" }
 }
 
@@ -161,15 +163,23 @@ function Set-JsonNumberOnLine {
 
 $edits = [ordered]@{}
 
+# The pre-edit text of every file, so the result can be compared against what was
+# actually there rather than against `HEAD`. Comparing to `HEAD` would count any
+# unrelated uncommitted work in the same file as a reformat, which is a false
+# alarm on a tree that is mid-feature.
+$originals = [ordered]@{}
+
 # tauri.conf.json: the app version is the first "version" key in the file, and
 # versionCode appears once.
 $tauriText = Get-Content $tauriPath -Raw
+$originals[$tauriPath] = $tauriText
 $tauriText = Set-JsonValueOnLine -Text $tauriText -Key 'version' -Value $Version -Label 'the app version in tauri.conf.json'
 $tauriText = Set-JsonNumberOnLine -Text $tauriText -Key 'versionCode' -Value $VersionCode -Label 'versionCode in tauri.conf.json'
 $edits[$tauriPath] = $tauriText
 
 # package.json: "version" is the first occurrence, before any dependency block.
 $packageText = Get-Content $packagePath -Raw
+$originals[$packagePath] = $packageText
 $packageText = Set-JsonValueOnLine -Text $packageText -Key 'version' -Value $Version -Label 'the version in package.json'
 $edits[$packagePath] = $packageText
 
@@ -191,6 +201,7 @@ for ($i = $packageTable + 1; $i -lt $cargoLines.Count; $i++) {
 if ($cargoVersionLine -lt 0) { throw "Could not find a version line in the [package] table of $cargoPath" }
 
 $cargoLines[$cargoVersionLine] = "version = `"$Version`""
+$originals[$cargoPath] = (Get-Content $cargoPath -Raw)
 $edits[$cargoPath] = ($cargoLines -join "`n") + "`n"
 
 # Cargo.lock: locate the `[[package]]` block whose name is exactly shadow720 and
@@ -210,6 +221,7 @@ for ($i = 0; $i -lt $lockLines.Count; $i++) {
 if ($lockVersionLine -lt 0) { throw "Could not find the shadow720 package in $lockPath" }
 
 $lockLines[$lockVersionLine] = "version = `"$Version`""
+$originals[$lockPath] = (Get-Content $lockPath -Raw)
 $edits[$lockPath] = ($lockLines -join "`n") + "`n"
 
 # README.md: prose references to the packaged filenames. These are not
@@ -221,10 +233,26 @@ $edits[$lockPath] = ($lockLines -join "`n") + "`n"
 # arrows in this file into mojibake and turns a three-line edit into a whole-file
 # rewrite.
 $readme = [System.IO.File]::ReadAllText($readmePath)
+$originals[$readmePath] = $readme
 $readme = $readme.Replace("Shadow720_${currentVersion}_", "Shadow720_${Version}_")
 $readme = $readme.Replace("Shadow720-${currentVersion}-", "Shadow720-${Version}-")
 $readme = $readme.Replace("What's new in $currentVersion", "What's new in $Version")
 $edits[$readmePath] = $readme
+
+# src/App.tsx: the build version shown on the failure screen and in the sidebar.
+#
+# This is a declaration, not prose: it is what a bug report quotes, so a stale
+# value makes an already-fixed bug indistinguishable from a new one. It was left
+# at 0.1.7 through the 0.1.8 release precisely because nothing checked it, so it
+# is now bumped and verified like the others.
+$app = [System.IO.File]::ReadAllText($appPath)
+$originals[$appPath] = $app
+$appPattern = '(?m)^(const APP_VERSION = ")([^"]*)(";)\r?$'
+if ($app -notmatch $appPattern) {
+    throw "Could not find the APP_VERSION declaration in src/App.tsx."
+}
+$app = [regex]::Replace($app, $appPattern, { param($m) $m.Groups[1].Value + $Version + $m.Groups[3].Value })
+$edits[$appPath] = $app
 
 # ---------------------------------------------------------------------------
 # Write, then verify by re-reading. A silent partial write is the failure mode
@@ -271,36 +299,43 @@ if ($checkLock -notmatch "(?m)^name = `"shadow720`"\r?\nversion = `"$([regex]::E
     $failures += "Cargo.lock shadow720 entry is not $Version"
 }
 
-# The whole point of this script: no dependency may have moved, and no file may
-# have been reformatted. Both show up as an unexpectedly large diff.
-#
-# Git writes its LF/CRLF notice to stderr, and with `$ErrorActionPreference =
-# 'Stop'` a native command's stderr is treated as a terminating error. The
-# preference is relaxed around this one call so the warning cannot abort a bump
-# that has already been written correctly.
-$previousPreference = $ErrorActionPreference
-$ErrorActionPreference = 'Continue'
-$diffStat = & git -C $root --no-pager diff --numstat 2>&1 |
-    Where-Object { $_ -is [string] -and $_ -match '^\d+\s+\d+\s+' }
-$ErrorActionPreference = $previousPreference
-foreach ($line in $diffStat) {
-    if (-not $line) { continue }
-    $parts = $line -split '\s+'
-    $added = [int]$parts[0]
-    $removed = [int]$parts[1]
-    $file = $parts[2]
+$checkApp = [System.IO.File]::ReadAllText($appPath)
+if ($checkApp -notmatch "(?m)^const APP_VERSION = `"$([regex]::Escape($Version))`";\r?$") {
+    $failures += "src/App.tsx APP_VERSION is not $Version"
+}
 
-    if ($file -like '*Cargo.lock' -and ($added -ne 1 -or $removed -ne 1)) {
-        $failures += "Cargo.lock changed by +$added/-$removed lines; expected exactly +1/-1. A dependency was rewritten."
+# The whole point of this script: no dependency may have moved, and no file may
+# have been reformatted.
+#
+# The comparison is against the text read before the edit, not against `HEAD`.
+# Comparing to `HEAD` counts unrelated uncommitted work in the same file as a
+# reformat, which is a false alarm on a tree that is mid-feature - and it cannot
+# see a reformat at all when the file was already dirty.
+#
+# The invariant asserted is stronger than a line count: every line that differs
+# must differ *only* by the version token. That is what proves no dependency was
+# rewritten, and it stays correct when a file is already at the target version
+# (a re-run changes nothing, which is not a failure).
+foreach ($path in $edits.Keys) {
+    $name = Split-Path -Leaf $path
+    if (-not $originals.Contains($path)) { continue }
+
+    $before = @($originals[$path] -split "`r?`n")
+    $after = @($edits[$path] -split "`r?`n")
+    if ($before.Count -ne $after.Count) {
+        $failures += "$name changed line count from $($before.Count) to $($after.Count). The file was reformatted."
+        continue
     }
-    if ($file -like '*tauri.conf.json' -and ($added -ne 2 -or $removed -ne 2)) {
-        $failures += "tauri.conf.json changed by +$added/-$removed lines; expected exactly +2/-2. The file was reformatted."
-    }
-    if ($file -like '*package.json' -and ($added -ne 1 -or $removed -ne 1)) {
-        $failures += "package.json changed by +$added/-$removed lines; expected exactly +1/-1. The file was reformatted."
-    }
-    if ($file -like '*Cargo.toml' -and ($added -ne 1 -or $removed -ne 1)) {
-        $failures += "Cargo.toml changed by +$added/-$removed lines; expected exactly +1/-1. A dependency was rewritten."
+
+    for ($i = 0; $i -lt $before.Count; $i++) {
+        if ($before[$i] -eq $after[$i]) { continue }
+
+        # Undo each permitted substitution; if any restores the original line, the
+        # only thing that changed on this line was a version token.
+        $restored = $after[$i].Replace($Version, $currentVersion).Replace("$VersionCode", "$currentCode")
+        if ($restored -ne $before[$i]) {
+            $failures += "$name line $($i + 1) changed beyond the version token: '$($before[$i].Trim())' -> '$($after[$i].Trim())'"
+        }
     }
 }
 if ($failures.Count -gt 0) {
@@ -315,4 +350,5 @@ Write-Host "  package.json     $Version"
 Write-Host "  Cargo.toml       $Version"
 Write-Host "  Cargo.lock       shadow720 $Version (no dependency touched)"
 Write-Host "  README.md        version references updated"
+Write-Host "  src/App.tsx      APP_VERSION $Version"
 Write-Host "`nNext: build with scripts/build-release.ps1, then commit and tag."
