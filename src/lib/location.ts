@@ -7,6 +7,8 @@
  * instead; that is what makes the map work in a desktop preview.
  */
 
+import * as api from "./api";
+
 export interface PositionFix {
   lat: number;
   lon: number;
@@ -274,6 +276,41 @@ export async function currentPosition(): Promise<LocationResult> {
       { enableHighAccuracy: true, timeout: 15_000, maximumAge: 5_000 },
     );
   });
+}
+
+/**
+ * Read the device's battery level and charging state.
+ *
+ * The native plugin is asked first, because the webview's Battery Status API is
+ * missing on some Android WebView builds. The browser API is the desktop
+ * fallback. Returning `null` rather than a fake `0` lets the UI say "battery
+ * unknown" instead of claiming the phone is dead.
+ */
+export async function readBattery(): Promise<{ pct: number; charging: boolean } | null> {
+  try {
+    const native = await api.batteryStatus();
+    if (typeof native.pct === "number" && native.pct > 0) {
+      return { pct: native.pct, charging: native.charging };
+    }
+  } catch {
+    // No native bridge, or the platform declined; fall through to the webview.
+  }
+
+  if (typeof navigator === "undefined") return null;
+  const battery = (navigator as Navigator & {
+    getBattery?: () => Promise<{ level: number; charging: boolean }>;
+  }).getBattery;
+  if (typeof battery !== "function") return null;
+  try {
+    const status = await battery.call(navigator);
+    if (!Number.isFinite(status.level)) return null;
+    return {
+      pct: Math.round(Math.min(1, Math.max(0, status.level)) * 100),
+      charging: Boolean(status.charging),
+    };
+  } catch {
+    return null;
+  }
 }
 
 /** A message suitable for display, or `null` when nothing useful can be said. */

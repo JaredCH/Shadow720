@@ -84,6 +84,127 @@ impl Activity {
             Activity::Driving
         }
     }
+
+    /// Stable wire string, for history summaries and diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Activity::Still => "still",
+            Activity::Walking => "walking",
+            Activity::Running => "running",
+            Activity::Cycling => "cycling",
+            Activity::Driving => "driving",
+        }
+    }
+}
+
+/// How many recent speed samples the tracker smooths over.
+pub const ACTIVITY_WINDOW: usize = 3;
+/// Fixes with a worse accuracy radius than this are ignored for classification.
+///
+/// A 200 m cell-tower fix can report a wild speed; letting it through would make
+/// a stationary member flicker to "driving" and back.
+pub const ACTIVITY_MAX_ACCURACY_M: f32 = 60.0;
+/// Consecutive agreeing samples required before the reported activity changes.
+pub const ACTIVITY_HYSTERESIS: u8 = 2;
+
+/// Smooths speed-based activity so one noisy fix cannot flip the label.
+///
+/// Two mechanisms do the work:
+///
+/// * a rolling **median** of the last [`ACTIVITY_WINDOW`] speeds, which rejects a
+///   single outlier without lagging behind a real change for long, and
+/// * **hysteresis**, which requires [`ACTIVITY_HYSTERESIS`] consecutive samples in
+///   a new class before the reported activity moves.
+///
+/// The result is what gets published, so peers see a stable label rather than a
+/// value that changes on every fix.
+#[derive(Clone, Debug)]
+pub struct ActivityTracker {
+    recent: std::collections::VecDeque<f32>,
+    current: Activity,
+    pending: Option<(Activity, u8)>,
+}
+
+impl Default for ActivityTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ActivityTracker {
+    /// A tracker that starts at [`Activity::Still`].
+    pub fn new() -> Self {
+        Self {
+            recent: std::collections::VecDeque::with_capacity(ACTIVITY_WINDOW),
+            current: Activity::Still,
+            pending: None,
+        }
+    }
+
+    /// The activity currently being reported.
+    pub fn current(&self) -> Activity {
+        self.current
+    }
+
+    /// The smoothed speed, or `None` before any usable sample.
+    pub fn smoothed_speed(&self) -> Option<f32> {
+        self.median_speed()
+    }
+
+    /// Feed one sample and return the activity to report.
+    ///
+    /// `accuracy_m` of `0.0` means "not reported" and is treated as usable.
+    pub fn observe(&mut self, speed_mps: f32, accuracy_m: f32) -> Activity {
+        if accuracy_m.is_finite() && accuracy_m > ACTIVITY_MAX_ACCURACY_M {
+            return self.current;
+        }
+        if speed_mps.is_finite() && speed_mps >= 0.0 {
+            if self.recent.len() == ACTIVITY_WINDOW {
+                self.recent.pop_front();
+            }
+            self.recent.push_back(speed_mps);
+        }
+
+        let Some(smoothed) = self.median_speed() else {
+            return self.current;
+        };
+        let candidate = Activity::from_speed(smoothed);
+
+        if candidate == self.current {
+            self.pending = None;
+            return self.current;
+        }
+
+        match self.pending {
+            Some((pending, count)) if pending == candidate => {
+                let next = count.saturating_add(1);
+                if next >= ACTIVITY_HYSTERESIS {
+                    self.current = candidate;
+                    self.pending = None;
+                } else {
+                    self.pending = Some((candidate, next));
+                }
+            }
+            _ => self.pending = Some((candidate, 1)),
+        }
+        self.current
+    }
+
+    /// Forget the window, e.g. after a long gap between fixes.
+    pub fn reset(&mut self) {
+        self.recent.clear();
+        self.pending = None;
+        self.current = Activity::Still;
+    }
+
+    fn median_speed(&self) -> Option<f32> {
+        if self.recent.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<f32> = self.recent.iter().copied().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.get(sorted.len() / 2).copied()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -577,6 +698,83 @@ mod tests {
         assert_eq!(Activity::from_speed(WALK_SPEED_MPS), Activity::Running);
         assert_eq!(Activity::from_speed(RUN_SPEED_MPS), Activity::Cycling);
         assert_eq!(Activity::from_speed(CYCLE_SPEED_MPS), Activity::Driving);
+    }
+
+    #[test]
+    fn activity_has_a_stable_wire_string() {
+        assert_eq!(Activity::Still.as_str(), "still");
+        assert_eq!(Activity::Walking.as_str(), "walking");
+        assert_eq!(Activity::Running.as_str(), "running");
+        assert_eq!(Activity::Cycling.as_str(), "cycling");
+        assert_eq!(Activity::Driving.as_str(), "driving");
+    }
+
+    // -- Activity tracker ----------------------------------------------------
+
+    #[test]
+    fn tracker_starts_still_and_needs_two_samples_to_change() {
+        let mut tracker = ActivityTracker::new();
+        assert_eq!(tracker.current(), Activity::Still);
+
+        // One fast sample is not enough: a single bad fix must not relabel a
+        // stationary member as driving.
+        assert_eq!(tracker.observe(25.0, 5.0), Activity::Still);
+        assert_eq!(tracker.observe(25.0, 5.0), Activity::Driving);
+        assert_eq!(tracker.current(), Activity::Driving);
+    }
+
+    #[test]
+    fn tracker_rejects_a_single_outlier() {
+        let mut tracker = ActivityTracker::new();
+        // Settle into walking.
+        tracker.observe(1.2, 5.0);
+        tracker.observe(1.2, 5.0);
+        assert_eq!(tracker.current(), Activity::Walking);
+
+        // One 30 m/s spike is outvoted by the median of the window.
+        assert_eq!(tracker.observe(30.0, 5.0), Activity::Walking);
+        assert_eq!(tracker.observe(1.2, 5.0), Activity::Walking);
+    }
+
+    #[test]
+    fn tracker_ignores_fixes_with_poor_accuracy() {
+        let mut tracker = ActivityTracker::new();
+        tracker.observe(1.2, 5.0);
+        tracker.observe(1.2, 5.0);
+        assert_eq!(tracker.current(), Activity::Walking);
+
+        // A 500 m cell-tower fix reports nonsense speed; it must not be used.
+        assert_eq!(tracker.observe(40.0, 500.0), Activity::Walking);
+        assert_eq!(tracker.observe(40.0, 500.0), Activity::Walking);
+        assert_eq!(tracker.current(), Activity::Walking);
+    }
+
+    #[test]
+    fn tracker_treats_unreported_accuracy_as_usable() {
+        let mut tracker = ActivityTracker::new();
+        tracker.observe(1.2, 0.0);
+        assert_eq!(tracker.observe(1.2, 0.0), Activity::Walking);
+    }
+
+    #[test]
+    fn tracker_reset_returns_to_still() {
+        let mut tracker = ActivityTracker::new();
+        tracker.observe(25.0, 5.0);
+        tracker.observe(25.0, 5.0);
+        assert_eq!(tracker.current(), Activity::Driving);
+        tracker.reset();
+        assert_eq!(tracker.current(), Activity::Still);
+        assert_eq!(tracker.smoothed_speed(), None);
+    }
+
+    #[test]
+    fn tracker_reports_a_smoothed_speed() {
+        let mut tracker = ActivityTracker::new();
+        tracker.observe(1.0, 5.0);
+        tracker.observe(9.0, 5.0);
+        tracker.observe(2.0, 5.0);
+        // Median of [1, 9, 2] is 2, not the mean of 4.
+        assert_eq!(tracker.smoothed_speed(), Some(2.0));
     }
 
     // -- Haversine -----------------------------------------------------------

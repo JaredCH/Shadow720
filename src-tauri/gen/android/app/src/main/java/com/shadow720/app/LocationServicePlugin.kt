@@ -12,8 +12,10 @@ package com.shadow720.app
  * one thing the app is declared to do.
  */
 
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.location.LocationManager
 import android.net.Uri
 import android.os.Build
@@ -34,6 +36,45 @@ class SetLocationSharingArgs {
 
 @TauriPlugin
 class LocationServicePlugin(private val activity: android.app.Activity) : Plugin(activity) {
+
+    /**
+     * Receives fixes from the foreground service and forwards them to the webview.
+     *
+     * Without this the service produced fixes that nothing consumed, so background
+     * sharing looked enabled while the pin never moved. The receiver is registered
+     * for the lifetime of the plugin, which is the lifetime of the app process.
+     */
+    private val fixReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != LocationForegroundService.ACTION_FIX) return
+            val payload = JSObject().apply {
+                put("lat", intent.getDoubleExtra(LocationForegroundService.EXTRA_LAT, 0.0))
+                put("lon", intent.getDoubleExtra(LocationForegroundService.EXTRA_LON, 0.0))
+                put("accuracyM", intent.getFloatExtra(LocationForegroundService.EXTRA_ACCURACY, 0f))
+                put("unixMs", intent.getLongExtra(LocationForegroundService.EXTRA_TIME_MS, 0L))
+                put("speedMps", intent.getFloatExtra(LocationForegroundService.EXTRA_SPEED, -1f))
+                put("headingDeg", intent.getFloatExtra(LocationForegroundService.EXTRA_HEADING, -1f))
+                put("batteryPct", intent.getIntExtra(LocationForegroundService.EXTRA_BATTERY, -1))
+                put("isCharging", intent.getBooleanExtra(LocationForegroundService.EXTRA_CHARGING, false))
+            }
+            trigger("locationFix", payload)
+        }
+    }
+
+    private var receiverRegistered = false
+
+    override fun load(webView: android.webkit.WebView) {
+        super.load(webView)
+        if (receiverRegistered) return
+        val filter = IntentFilter(LocationForegroundService.ACTION_FIX)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            activity.registerReceiver(fixReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            activity.registerReceiver(fixReceiver, filter)
+        }
+        receiverRegistered = true
+    }
 
     @Command
     fun setLocationSharingEnabled(invoke: Invoke) {
@@ -84,6 +125,32 @@ class LocationServicePlugin(private val activity: android.app.Activity) : Plugin
             }
         } ?: false
         invoke.resolve(JSObject().put("enabled", enabled))
+    }
+
+    /**
+     * Battery level and charging state.
+     *
+     * The webview's Battery Status API is not available on every Android WebView,
+     * so the platform is asked directly. `pct` is `-1` when the system declines to
+     * report a level, which the UI renders as "unknown" rather than "0%".
+     */
+    @Command
+    fun batteryStatus(invoke: Invoke) {
+        val manager = activity.getSystemService(Context.BATTERY_SERVICE) as? android.os.BatteryManager
+        val pct = manager
+            ?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
+            ?.takeIf { it in 0..100 }
+            ?: -1
+
+        val batteryIntent = activity.registerReceiver(
+            null,
+            android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED),
+        )
+        val status = batteryIntent?.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1) ?: -1
+        val charging = status == android.os.BatteryManager.BATTERY_STATUS_CHARGING ||
+            status == android.os.BatteryManager.BATTERY_STATUS_FULL
+
+        invoke.resolve(JSObject().put("pct", pct).put("charging", charging))
     }
 
     /**

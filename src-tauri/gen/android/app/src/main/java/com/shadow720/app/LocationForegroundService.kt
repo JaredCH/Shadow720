@@ -148,8 +148,31 @@ class LocationForegroundService : Service() {
             putExtra(EXTRA_LON, location.longitude)
             putExtra(EXTRA_ACCURACY, location.accuracy)
             putExtra(EXTRA_TIME_MS, location.time)
+            // Speed and heading come from the platform's own sensor fusion, which
+            // is far less noisy than differencing two positions 30 seconds apart.
+            putExtra(EXTRA_SPEED, if (location.hasSpeed()) location.speed else -1f)
+            putExtra(EXTRA_HEADING, if (location.hasBearing()) location.bearing else -1f)
+            putExtra(EXTRA_BATTERY, batteryPercent())
+            putExtra(EXTRA_CHARGING, isCharging())
         }
         sendBroadcast(intent)
+    }
+
+    /** Battery percentage, or `-1` when the system will not report it. */
+    private fun batteryPercent(): Int {
+        val manager = getSystemService(Context.BATTERY_SERVICE) as? android.os.BatteryManager
+            ?: return -1
+        val level = manager.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
+        return if (level in 0..100) level else -1
+    }
+
+    /** True when the device is on external power. */
+    private fun isCharging(): Boolean {
+        val intent = registerReceiver(null, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            ?: return false
+        val status = intent.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1)
+        return status == android.os.BatteryManager.BATTERY_STATUS_CHARGING ||
+            status == android.os.BatteryManager.BATTERY_STATUS_FULL
     }
 
     private fun ensureChannel() {
@@ -228,6 +251,10 @@ class LocationForegroundService : Service() {
         const val EXTRA_LON = "lon"
         const val EXTRA_ACCURACY = "accuracy"
         const val EXTRA_TIME_MS = "time_ms"
+        const val EXTRA_SPEED = "speed_mps"
+        const val EXTRA_HEADING = "heading_deg"
+        const val EXTRA_BATTERY = "battery_pct"
+        const val EXTRA_CHARGING = "charging"
 
         private const val CHANNEL_ID = "shadow720.location"
         private const val NOTIFICATION_ID = 7201

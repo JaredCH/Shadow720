@@ -312,8 +312,15 @@ pub struct GroupState {
     pub chat: RwLock<Vec<ChatItem>>,
     /// Own latest known fix, so the UI can render self immediately.
     pub my_fix: RwLock<Option<Fix>>,
+    /// Own latest battery reading, so a publish carries it even when the fix that
+    /// triggered the publish did not include one.
+    pub my_battery: RwLock<(u8, bool)>,
     /// Recent positions per member, oldest first, for the fading trail.
     pub trails: RwLock<std::collections::HashMap<String, Vec<TrailPoint>>>,
+    /// Month-long track log, kept on this device only.
+    pub history: RwLock<crate::history::TrackHistory>,
+    /// Smoothed activity per member, so a single noisy fix cannot flip the label.
+    pub activity: RwLock<HashMap<String, crate::geo_filter::ActivityTracker>>,
 }
 
 /// One recorded position on a member's trail.
@@ -468,7 +475,10 @@ impl GroupState {
             roster: RwLock::new(Vec::new()),
             chat: RwLock::new(Vec::new()),
             my_fix: RwLock::new(None),
+            my_battery: RwLock::new((0, false)),
             trails: RwLock::new(std::collections::HashMap::new()),
+            history: RwLock::new(crate::history::TrackHistory::new()),
+            activity: RwLock::new(HashMap::new()),
         })
     }
 
@@ -668,11 +678,26 @@ impl GroupState {
         gate.reset();
     }
 
+    /// Record this device's battery state.
+    ///
+    /// Kept separately from the fix because battery changes on its own schedule:
+    /// a phone can drop 20% while its owner sits at a desk, and that is exactly
+    /// the moment peers want to know.
+    pub fn set_battery(&self, battery_pct: u8, is_charging: bool) {
+        *self.my_battery.write() = (battery_pct.min(100), is_charging);
+    }
+
+    /// This device's last known battery state.
+    pub fn battery(&self) -> (u8, bool) {
+        *self.my_battery.read()
+    }
+
     /// Build the roster envelope for a fix.
     pub fn build_location_envelope(&self, fix: Fix) -> Result<EncryptedEnvelope> {
         let preferences = self.preferences();
         let key = self.current_group_key()?;
         let epoch = self.current_epoch();
+        let (battery_pct, is_charging) = self.battery();
 
         let state = LocationState {
             display_name: preferences.display_name.clone(),
@@ -682,8 +707,8 @@ impl GroupState {
             accuracy_m: fix.accuracy_m,
             speed_mps: fix.speed_mps,
             heading_deg: fix.heading_deg,
-            battery_pct: 0,
-            is_charging: false,
+            battery_pct,
+            is_charging,
             unix_ms: fix.unix_ms,
             member_pubkey: self.identity.pubkey_b64.clone(),
         };
@@ -911,7 +936,7 @@ impl GroupState {
             accuracy_m: state.accuracy_m,
             speed_mps: state.speed_mps,
             heading_deg: state.heading_deg,
-            activity: crate::geo_filter::Activity::from_speed(state.speed_mps),
+            activity: self.activity_of(sender_pubkey, state.speed_mps),
             battery_pct: state.battery_pct,
             is_charging: state.is_charging,
             unix_ms: state.unix_ms,
@@ -1011,14 +1036,43 @@ impl GroupState {
         count
     }
 
-    /// Append each member's current position to their trail.
+    /// Append each member's current position to their trail and the track log.
     ///
     /// Points are deduplicated by spacing and capped, so a member who sits still
     /// does not fill the buffer with identical coordinates and a long session does
     /// not grow it without bound.
+    ///
+    /// The same pass feeds two other things, because they need exactly the same
+    /// input and doing it once keeps them consistent:
+    ///
+    /// * the **activity tracker**, which smooths the reported speed so a single
+    ///   noisy fix cannot flip a member between "walking" and "driving", and
+    /// * the **track log**, which is the month-long history the map's history view
+    ///   reads. It is local-only and never published.
     fn record_trails(&self, members: &[MemberView]) {
+        let now_ms = crate::github_db::now_unix_ms();
         let mut trails = self.trails.write();
+        let mut history = self.history.write();
+        let mut activity = self.activity.write();
+
         for member in members {
+            let tracker = activity.entry(member.pubkey_b64.clone()).or_default();
+            let smoothed = tracker.observe(member.speed_mps, member.accuracy_m);
+
+            history.record(
+                &member.pubkey_b64,
+                crate::history::TrackPoint {
+                    lat: member.lat,
+                    lon: member.lon,
+                    unix_ms: member.unix_ms,
+                    speed_mps: member.speed_mps,
+                    activity: smoothed,
+                    battery_pct: member.battery_pct,
+                    is_charging: member.is_charging,
+                },
+                now_ms,
+            );
+
             let points = trails.entry(member.pubkey_b64.clone()).or_default();
             let last = points.last().copied();
             let should_push = match last {
@@ -1045,6 +1099,56 @@ impl GroupState {
         self.trails.read().clone()
     }
 
+    /// Smoothed activity for `pubkey`, falling back to the raw speed class.
+    ///
+    /// The tracker is authoritative once it has seen a sample; the fallback only
+    /// matters for a member decoded before any roster pass has run.
+    pub fn activity_of(&self, pubkey: &str, speed_mps: f32) -> crate::geo_filter::Activity {
+        self.activity
+            .read()
+            .get(pubkey)
+            .map(|tracker| tracker.current())
+            .unwrap_or_else(|| crate::geo_filter::Activity::from_speed(speed_mps))
+    }
+
+    /// Track points for one member at or after `since_ms`, oldest first.
+    pub fn history_since(&self, pubkey: &str, since_ms: i64) -> Vec<crate::history::TrackPoint> {
+        self.history.read().points_since(pubkey, since_ms)
+    }
+
+    /// Every member's track points at or after `since_ms`.
+    pub fn history_snapshot(
+        &self,
+        since_ms: i64,
+    ) -> std::collections::HashMap<String, Vec<crate::history::TrackPoint>> {
+        self.history.read().snapshot_since(since_ms)
+    }
+
+    /// Replace the in-memory track log, e.g. after loading it from disk.
+    pub fn install_history(&self, history: crate::history::TrackHistory) {
+        *self.history.write() = history;
+    }
+
+    /// Persist the track log when it has unsaved changes.
+    ///
+    /// Returns `true` when a write happened. A failure is returned rather than
+    /// swallowed so the caller can decide whether it is worth telling the user;
+    /// losing history is not fatal to the app.
+    pub fn save_history(&self, dir: &std::path::Path) -> Result<bool> {
+        let key = self.current_group_key()?;
+        let mut history = self.history.write();
+        if !history.is_dirty() {
+            return Ok(false);
+        }
+        history.save(dir, &key)?;
+        Ok(true)
+    }
+
+    /// Drop one member's history, e.g. when they are blocked.
+    pub fn forget_history(&self, pubkey: &str) {
+        self.history.write().forget(pubkey);
+        self.activity.write().remove(pubkey);
+    }
     /// Replace the chat log with a freshly decoded set.
     ///
     /// Undecryptable comments are surfaced as [`ChatItem::Undecryptable`] so the
@@ -1790,6 +1894,60 @@ mod tests {
             .consider_location(Fix::at(41.0, -87.0, 1_700_000_001_000,))
             .expect("consider");
         assert_eq!(decision, Publish::Yes);
+    }
+
+    #[test]
+    fn battery_is_carried_into_the_published_envelope() {
+        let me = identity();
+        let state = GroupState::from_invite(&invite_for(&me.pubkey_b64), me, prefs(), true).expect("state");
+
+        state.set_battery(37, true);
+        assert_eq!(state.battery(), (37, true));
+
+        let envelope = state
+            .build_location_envelope(Fix::at(41.0, -87.0, 1_700_000_000_000))
+            .expect("seal");
+        let opened = state.keys.read().open(&envelope).expect("open");
+        match opened {
+            InnerPayload::Location(location) => {
+                assert_eq!(location.battery_pct, 37);
+                assert!(location.is_charging);
+            }
+            other => panic!("expected location, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn battery_is_clamped_to_a_percentage() {
+        let state = state();
+        state.set_battery(250, false);
+        assert_eq!(state.battery(), (100, false));
+    }
+
+    #[test]
+    fn history_records_roster_positions() {
+        let state = state();
+        let me = identity();
+        let now = crate::github_db::now_unix_ms();
+
+        state.apply_roster(&[roster_comment(&state, &me, Fix::at(1.0, 1.0, now - 20_000), "Me")]);
+        state.apply_roster(&[roster_comment(&state, &me, Fix::at(1.01, 1.0, now), "Me")]);
+        let points = state.history_since(&me.pubkey_b64, 0);
+        assert_eq!(points.len(), 2, "both positions are kept in the track log");
+        assert!(points[0].unix_ms < points[1].unix_ms);
+    }
+
+    #[test]
+    fn forgetting_history_drops_the_member_and_their_activity() {
+        let state = state();
+        let me = identity();
+        let now = crate::github_db::now_unix_ms();
+        state.apply_roster(&[roster_comment(&state, &me, Fix::at(1.0, 1.0, now), "Me")]);
+        assert!(!state.history_since(&me.pubkey_b64, 0).is_empty());
+
+        state.forget_history(&me.pubkey_b64);
+        assert!(state.history_since(&me.pubkey_b64, 0).is_empty());
+        assert!(!state.activity.read().contains_key(&me.pubkey_b64));
     }
 
     #[test]

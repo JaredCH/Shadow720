@@ -60,6 +60,14 @@ The difference is what it *doesn't* have.
 
 There is nothing to host, so there is nothing to pay for. The storage is free-tier infrastructure that already exists: public Nostr relays and Blossom blob servers. The app is MIT-licensed and the whole thing runs on your hardware.
 
+### What's new in 0.1.7
+
+- **Tap a name to fly there.** Selecting a member in the roster centres and zooms the map on them, and turns off "Following you" so the view stays put.
+- **A month of history.** Every device keeps a 31-day track log, grouped by day and week, with distance, dominant activity, and lowest battery per day. It is sealed with the group key and never published.
+- **Activity that doesn't flicker.** A rolling median plus hysteresis means one bad GPS fix can no longer relabel a stationary member as "driving".
+- **Battery that actually works.** Level and charging state were hardcoded to `0`; they are now read from the platform and colour-coded, with a per-day low in the history view.
+- **Background location actually publishes.** The Android foreground service was broadcasting fixes that nothing received. It now forwards them to the core, so the pin keeps moving with the screen off.
+
 ---
 
 ## ⚠️ Right now, Nostr is the only working option
@@ -98,13 +106,13 @@ The Android APK is signed with a self-signed key, so Android will ask you to all
 
 ```bash
 # Debian / Ubuntu / Mint
-sudo apt install ./Shadow720_0.1.6_amd64.deb
+sudo apt install ./Shadow720_0.1.7_amd64.deb
 
 # Fedora / RHEL / Rocky / Alma
-sudo dnf install ./Shadow720-0.1.6-1.x86_64.rpm
+sudo dnf install ./Shadow720-0.1.7-1.x86_64.rpm
 
 # Any distro, no install
-chmod +x Shadow720_0.1.6_amd64.AppImage && ./Shadow720_0.1.6_amd64.AppImage
+chmod +x Shadow720_0.1.7_amd64.AppImage && ./Shadow720_0.1.7_amd64.AppImage
 ```
 
 The Linux build needs WebKitGTK 4.1 (`libwebkit2gtk-4.1-0`), which the `.deb` and `.rpm` pull in automatically. The AppImage bundles it.
@@ -141,11 +149,14 @@ Paste the invite string, enter the join password you were given separately, and 
 
 | Area | State |
 |---|---|
-| Rust core | **415 unit tests**, all passing |
+| Rust core | **438 unit tests**, all passing |
 | TypeScript UI | `tsc --noEmit` clean, production bundle builds |
-| Map | OpenStreetMap basemap, follows the OS light/dark theme, fading travel trails |
+| Map | OpenStreetMap basemap, follows the OS light/dark theme, fading travel trails with heading arrows |
+| Map focus | Tapping a name in the roster centres and zooms the map on that member |
+| History | Month-long local track log, grouped by day and week, with distance, activity, and battery |
 | Desktop | Wide 1260×720 window, left navigation rail, map beside the member list, resizable |
-| Activity | Stationary / walking / running / cycling / driving, from reported speed |
+| Activity | Stationary / walking / running / cycling / driving, smoothed so one bad fix cannot flip the label |
+| Battery | Level and charging state per member, colour-coded, with a per-day low in the history view |
 | Groups | Multiple groups per device, switchable offline |
 | Chat | Text, file pointers, per-message moderation, author-signed deletion |
 | Roles | Owner / admin / member, with owner-only kick and key rotation |
@@ -223,6 +234,28 @@ Publishing every GPS fix would burn battery and flood relays, so the core gates 
 
 Activity is inferred from reported speed: `< 0.8 m/s` stationary, `< 1.5` walking, `< 4.0` running, `< 8.0` cycling, above that driving.
 
+The raw speed class is not published directly. A rolling median over the last three samples plus two-sample hysteresis means one noisy fix cannot flip a member between "walking" and "driving", and fixes with an accuracy radius worse than 60 m are ignored for classification entirely.
+
+### Location history
+
+Each device keeps a **month-long track log** of every member it has seen. It is local only: nothing about the history is ever published, so the group's shared footprint is the same size whether the app has been running for a minute or a month.
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `HISTORY_RETENTION_DAYS` | 31 | how far back the log goes |
+| `HISTORY_FULL_RES_MS` | 6 h | points newer than this keep their original resolution |
+| `HISTORY_THIN_INTERVAL_MS` | 15 min | older points are thinned to one per interval |
+| `HISTORY_MAX_POINTS` | 4 000 | hard cap per member |
+| `HISTORY_MIN_SPACING_M` | 8 m | a stationary member with an unchanged battery adds nothing |
+
+The log is sealed with the group key and written beside the vault, so it is unreadable without both the device key and the group key. Blocking a member deletes their history, because keeping a month of someone's movements after blocking them would defeat the point.
+
+The map's history panel groups the log by day and by week, and shows each day's distance, dominant activity, and lowest battery.
+
+### Battery
+
+Battery level and charging state ride along with each published fix. Android is asked through the native plugin, because the webview's Battery Status API is missing on some WebView builds; desktop falls back to the browser API. A platform that declines to report a level sends `0`, which the UI renders as "battery —" rather than claiming the phone is dead.
+
 ---
 
 ## Security model
@@ -297,7 +330,8 @@ Deliberately small. Every crate below is doing a job that cannot be done safely 
 ```
 src/                      React UI
   lib/api.ts              typed bridge to every Rust command
-  lib/location.ts         geolocation, permissions, background toggle
+  lib/location.ts         geolocation, permissions, background toggle, battery
+  lib/history.ts          day/week grouping and summaries for the history panel
   lib/tiles.ts            Web Mercator helpers for the canvas map
   components/             consent gates, map, chat, settings
 src-tauri/
@@ -305,7 +339,8 @@ src-tauri/
   src/nostr.rs            event construction and signing
   src/nostr_relay.rs      WebSocket relay transport
   src/nostr_store.rs      roster, chat, and blob storage on relays
-  src/geo_filter.rs       movement gate, cadence, jitter, backoff
+  src/geo_filter.rs       movement gate, cadence, jitter, backoff, activity smoothing
+  src/history.rs          month-long local track log, sealed with the group key
   src/github_db.rs        ETag cache, comments, release assets, pruning
   src/vault.rs            sealed vault + keystore trait
   src/group.rs            in-memory group state and policy

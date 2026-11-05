@@ -41,6 +41,7 @@ pub mod error;
 pub mod geo_filter;
 pub mod github_db;
 pub mod group;
+pub mod history;
 pub mod nostr;
 pub mod nostr_relay;
 pub mod nostr_store;
@@ -168,6 +169,7 @@ pub fn run() {
             commands::set_preferences,
                         commands::set_background_location,
             commands::location_access,
+            commands::battery_status,
             commands::open_location_settings,
             commands::begin_sign_in,
             commands::poll_sign_in,
@@ -181,6 +183,9 @@ pub fn run() {
             commands::refresh_rate_limit,
             commands::roster_snapshot,
             commands::chat_snapshot,
+            commands::location_history,
+            commands::save_location_history,
+            commands::clear_location_history,
             commands::diagnostics,
             commands::send_text,
             commands::send_file,

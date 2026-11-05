@@ -1,6 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { Activity, MemberView, TrailPoint } from "../lib/api";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { MemberView, TrackPoint, TrailPoint } from "../lib/api";
 import { formatDistance, readableOn, relativeAge } from "../lib/format";
+import {
+  batteryTone,
+  describeActivity,
+  describeDay,
+  describeWeek,
+  groupByDay,
+  groupByWeek,
+} from "../lib/history";
 import { PeerMap } from "./PeerMap";
 
 /**
@@ -25,21 +33,14 @@ function useColorScheme(): "dark" | "streets" {
   return light ? "streets" : "dark";
 }
 
-/** Icon and label for a member's activity. */
-function describeActivity(activity: Activity): { icon: string; label: string } {
-  switch (activity) {
-    case "walking":
-      return { icon: "🚶", label: "Walking" };
-    case "running":
-      return { icon: "🏃", label: "Running" };
-    case "cycling":
-      return { icon: "🚴", label: "Cycling" };
-    case "driving":
-      return { icon: "🚗", label: "Driving" };
-    default:
-      return { icon: "📍", label: "Stationary" };
-  }
-}
+/** How far back the history panel can look. */
+const HISTORY_RANGES = [
+  { hours: 1, label: "1h" },
+  { hours: 6, label: "6h" },
+  { hours: 24, label: "24h" },
+  { hours: 24 * 7, label: "7d" },
+  { hours: 24 * 31, label: "31d" },
+] as const;
 
 interface MapPanelProps {
   members: MemberView[];
@@ -49,6 +50,8 @@ interface MapPanelProps {
   trails: Record<string, TrailPoint[]>;
   selectedPubkey: string | null;
   onSelect: (pubkeyB64: string | null) => void;
+  /** Load a member's track history. Omit to hide the history panel. */
+  onLoadHistory?: (pubkeyB64: string, hours: number) => Promise<TrackPoint[]>;
 }
 
 /**
@@ -64,10 +67,29 @@ export function MapPanel({
   trails,
   selectedPubkey,
   onSelect,
+  onLoadHistory,
 }: MapPanelProps) {
   const basemap = useColorScheme();
   const [followSelf, setFollowSelf] = useState(true);
   const listRef = useRef<HTMLDivElement | null>(null);
+
+  /**
+   * The member the map should fly to.
+   *
+   * The nonce is what makes a second tap on the same name work: the pubkey alone
+   * would not change, so the effect in `PeerMap` would not re-run.
+   */
+  const [focus, setFocus] = useState<{ pubkeyB64: string; nonce: number } | null>(null);
+  const [historyHours, setHistoryHours] = useState<number>(24);
+  const [history, setHistory] = useState<TrackPoint[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [showHistory, setShowHistory] = useState(false);
+
+  const selectedMember = useMemo(
+    () => members.find((member) => member.pubkeyB64 === selectedPubkey) ?? null,
+    [members, selectedPubkey],
+  );
 
   // The reference point is this device's fix when known, otherwise the median of
   // the group. A world view is the fallback so the map is always visible: an empty
@@ -112,6 +134,63 @@ export function MapPanel({
     target?.scrollIntoView({ block: "nearest", behavior: "smooth" });
   }, [selectedPubkey]);
 
+  /** Select a member and fly the map to them. */
+  const focusMember = useCallback(
+    (pubkeyB64: string) => {
+      onSelect(pubkeyB64);
+      setFocus({ pubkeyB64, nonce: Date.now() });
+      // Following self would immediately drag the view back, which makes the tap
+      // look broken. Selecting someone is an explicit "show me them" request.
+      setFollowSelf(false);
+    },
+    [onSelect],
+  );
+
+  const loadHistory = useCallback(
+    async (pubkeyB64: string, hours: number) => {
+      if (!onLoadHistory) return;
+      setHistoryLoading(true);
+      setHistoryError(null);
+      try {
+        const points = await onLoadHistory(pubkeyB64, hours);
+        setHistory(points);
+      } catch (thrown) {
+        setHistory([]);
+        setHistoryError(
+          thrown instanceof Error ? thrown.message : "Could not load history.",
+        );
+      } finally {
+        setHistoryLoading(false);
+      }
+    },
+    [onLoadHistory],
+  );
+
+  // Reload whenever the selection or the range changes, so the panel never shows
+  // one member's track under another member's name.
+  useEffect(() => {
+    if (!showHistory || !selectedPubkey || !onLoadHistory) {
+      setHistory([]);
+      return;
+    }
+    void loadHistory(selectedPubkey, historyHours);
+  }, [showHistory, selectedPubkey, historyHours, loadHistory, onLoadHistory]);
+
+  const historyDays = useMemo(() => groupByDay(history), [history]);
+  const historyWeeks = useMemo(() => groupByWeek(historyDays), [historyDays]);
+
+  const historyTrack = useMemo(() => {
+    if (!showHistory || !selectedMember || history.length < 2) return null;
+    return {
+      points: history.map((point) => ({
+        lat: point.lat,
+        lon: point.lon,
+        unixMs: point.unixMs,
+      })),
+      colour: selectedMember.avatarColor,
+    };
+  }, [showHistory, selectedMember, history]);
+
   return (
     <div className="flex h-full flex-col gap-3">
       <div className="flex items-center justify-between gap-2">
@@ -147,11 +226,42 @@ export function MapPanel({
             onSelect={onSelect}
             basemap={basemap}
             placeholderZoom={hasPosition ? undefined : 2}
+            focus={focus}
+            historyTrack={historyTrack}
           />
 
           {!hasPosition ? (
             <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-surface to-transparent p-4 text-center text-xs text-slate-400">
               Waiting for the first location update. Pan and zoom to explore.
+            </div>
+          ) : null}
+
+          {selectedMember ? (
+            <div className="pointer-events-none absolute inset-x-2 top-2 flex items-center gap-2 rounded-xl bg-black/65 px-3 py-2 backdrop-blur">
+              <span
+                className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[10px] font-bold"
+                style={{
+                  backgroundColor: selectedMember.avatarColor,
+                  color: readableOn(selectedMember.avatarColor),
+                }}
+                aria-hidden
+              >
+                {selectedMember.displayName.slice(0, 2).toUpperCase() || "?"}
+              </span>
+              <span className="min-w-0 flex-1 truncate text-xs font-semibold text-slate-100">
+                {selectedMember.isSelf ? "You" : selectedMember.displayName || "Member"}
+              </span>
+              <span className="shrink-0 text-[11px] text-slate-300">
+                {describeActivity(selectedMember.activity).icon}{" "}
+                {describeActivity(selectedMember.activity).label}
+              </span>
+              <span
+                className={`shrink-0 text-[11px] font-medium ${batteryTone(selectedMember.batteryPct)}`}
+              >
+                {selectedMember.batteryPct > 0
+                  ? `${selectedMember.batteryPct}%${selectedMember.isCharging ? " ⚡" : ""}`
+                  : "—"}
+              </span>
             </div>
           ) : null}
         </div>
@@ -176,13 +286,18 @@ export function MapPanel({
                 data-pubkey={member.pubkeyB64}
                 type="button"
                 onClick={() =>
-                  onSelect(selected ? null : member.pubkeyB64)
+                  selected ? onSelect(null) : focusMember(member.pubkeyB64)
                 }
                 className={`flex w-full items-center gap-3 rounded-xl border p-3 text-left ${
                   selected
                     ? "border-accent bg-surface"
                     : "border-surface-border bg-surface-raised"
                 }`}
+                title={
+                  selected
+                    ? "Clear the selection"
+                    : `Centre the map on ${member.displayName || "this member"}`
+                }
               >
                 <span
                   className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-xs font-bold"
@@ -218,8 +333,10 @@ export function MapPanel({
                       </>
                     ) : null}
                     <span aria-hidden>·</span>
-                    <span>
-                      {member.batteryPct}%{member.isCharging ? " ⚡" : ""}
+                    <span className={batteryTone(member.batteryPct)}>
+                      {member.batteryPct > 0
+                        ? `${member.batteryPct}%${member.isCharging ? " ⚡" : ""}`
+                        : "battery —"}
                     </span>
                   </span>
                 </span>
@@ -233,6 +350,100 @@ export function MapPanel({
             );
           })
         )}
+
+        {selectedMember && onLoadHistory ? (
+          <div className="card space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <button
+                type="button"
+                onClick={() => setShowHistory((previous) => !previous)}
+                className="text-xs font-semibold text-slate-200"
+                aria-expanded={showHistory}
+              >
+                {showHistory ? "▾" : "▸"} History
+              </button>
+              <span className="text-[10px] text-slate-500">
+                {selectedMember.isSelf ? "you" : selectedMember.displayName || "member"}
+              </span>
+            </div>
+            {showHistory ? (
+              <>
+                <div className="flex flex-wrap gap-1">
+                  {HISTORY_RANGES.map((range) => (
+                    <button
+                      key={range.hours}
+                      type="button"
+                      onClick={() => setHistoryHours(range.hours)}
+                      className={`rounded-lg border px-2 py-1 text-[11px] font-medium ${
+                        historyHours === range.hours
+                          ? "border-accent bg-accent/15 text-accent"
+                          : "border-surface-border bg-surface-raised text-slate-400"
+                      }`}
+                    >
+                      {range.label}
+                    </button>
+                  ))}
+                </div>
+
+                {historyLoading ? (
+                  <p className="text-xs text-slate-500">Loading…</p>
+                ) : historyError ? (
+                  <p className="text-xs text-rose-400">{historyError}</p>
+                ) : history.length === 0 ? (
+                  <p className="text-xs text-slate-500">
+                    No recorded positions in this range. History is kept on this
+                    device only, so it starts when the app first sees a member.
+                  </p>
+                ) : (
+                  <div className="space-y-2">
+                    {historyWeeks.map((week) => (
+                      <div key={week.startMs} className="space-y-1">
+                        <div className="flex items-baseline justify-between gap-2">
+                          <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                            {describeWeek(week.startMs)}
+                          </span>
+                          <span className="text-[10px] text-slate-500">
+                            {formatDistance(week.distanceM)}
+                          </span>
+                        </div>
+                        {week.days.map((day) => {
+                          const activity = describeActivity(day.dominantActivity);
+                          return (
+                            <div
+                              key={day.startMs}
+                              className="flex items-center gap-2 rounded-lg bg-surface-raised px-2 py-1.5 text-[11px]"
+                            >
+                              <span className="w-20 shrink-0 text-slate-300">
+                                {describeDay(day.startMs)}
+                              </span>
+                              <span className="shrink-0" title={activity.label}>
+                                {activity.icon}
+                              </span>
+                              <span className="min-w-0 flex-1 truncate text-slate-400">
+                                {formatDistance(day.distanceM)}
+                              </span>
+                              {day.lowestBatteryPct !== null ? (
+                                <span
+                                  className={`shrink-0 ${batteryTone(day.lowestBatteryPct)}`}
+                                  title={
+                                    day.charged
+                                      ? "Lowest battery that day; charged at some point"
+                                      : "Lowest battery that day"
+                                  }
+                                >
+                                  {day.lowestBatteryPct}%{day.charged ? " ⚡" : ""}
+                                </span>
+                              ) : null}                            </div>
+                          );
+                        })}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
+            ) : null}
+          </div>
+        ) : null}
         </div>
       </div>
     </div>

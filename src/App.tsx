@@ -15,6 +15,7 @@ import {
   locationRemedy,
   locationRemedyLabel,
   openLocationRemedy,
+  readBattery,
   requestLocationPermission,
 } from "./lib/location";
 import type { LocationFailure, LocationRemedy } from "./lib/location";
@@ -50,7 +51,7 @@ const MIN_CHAT_DELAY_MS = 1_000;
  * Without it there is no way to tell which APK is installed, which made a
  * report of an already-fixed bug indistinguishable from a new one.
  */
-const APP_VERSION = "0.1.6";
+const APP_VERSION = "0.1.7";
 const MIN_ROSTER_DELAY_MS = 3_000;
 
 /** How often to refresh the local GPS fix while the map tab is visible. */
@@ -324,11 +325,17 @@ export default function App() {
     setSelfFix(result.fix);
     setLocationNotice(null);
 
+    // Battery is read alongside the fix rather than on its own timer: the two are
+    // published together, and a separate loop would only add wakeups.
+    const battery = await readBattery();
+
     try {
       await api.updateLocation(result.fix.lat, result.fix.lon, {
         speedMps: result.fix.speedMps,
         headingDeg: result.fix.headingDeg,
         accuracyM: result.fix.accuracyM,
+        batteryPct: battery?.pct,
+        isCharging: battery?.charging,
       });
       // Reflect the new position immediately rather than waiting for a poll.
       const snapshot = await api.rosterSnapshot();
@@ -429,6 +436,96 @@ export default function App() {
     document.addEventListener("visibilitychange", onVisible);
     return () => document.removeEventListener("visibilitychange", onVisible);
   }, [phase, locationNotice, pushFix, showLocationFailure]);
+
+  // -- native background fixes -----------------------------------------------
+
+  /**
+   * Consume fixes from the Android foreground service.
+   *
+   * The service keeps producing positions with the screen off, but until this
+   * listener existed nothing read them, so background sharing looked enabled while
+   * the pin never moved. Each fix is published through the same command the
+   * foreground loop uses, so the movement gate and cadence policy still apply.
+   */
+  useEffect(() => {
+    if (phase !== "ready" || !disclosureAccepted) return;
+    let cancelled = false;
+    let unsubscribe: (() => void) | null = null;
+
+    void (async () => {
+      const stop = await api.onNativeFix((fix) => {
+        if (cancelled || activePhase.current !== "ready") return;
+        if (!Number.isFinite(fix.lat) || !Number.isFinite(fix.lon)) return;
+        setSelfFix({ lat: fix.lat, lon: fix.lon });
+        void api
+          .updateLocation(fix.lat, fix.lon, {
+            speedMps: fix.speedMps >= 0 ? fix.speedMps : undefined,
+            headingDeg: fix.headingDeg >= 0 ? fix.headingDeg : undefined,
+            accuracyM: fix.accuracyM > 0 ? fix.accuracyM : undefined,
+            batteryPct: fix.batteryPct >= 0 ? fix.batteryPct : undefined,
+            isCharging: fix.isCharging,
+          })
+          .then(async () => {
+            const snapshot = await api.rosterSnapshot();
+            if (cancelled) return;
+            setRoster(snapshot.members);
+            setTrails(snapshot.trails);
+          })
+          .catch(() => {
+            // A failed publish is retried by the next fix; the foreground loop
+            // also keeps running, so this is not worth a banner.
+          });
+      });
+      if (cancelled) stop();
+      else unsubscribe = stop;
+    })();
+
+    return () => {
+      cancelled = true;
+      unsubscribe?.();
+    };
+  }, [phase, disclosureAccepted]);
+
+  // -- location history ------------------------------------------------------
+
+  /**
+   * Load a member's track history for the map's history panel.
+   *
+   * Local only, so this is cheap and works offline. The core clamps the range to
+   * the retention window.
+   */
+  const loadHistory = useCallback(async (pubkeyB64: string, hours: number) => {
+    const response = await api.locationHistory({ pubkeyB64, hours });
+    return response.tracks[pubkeyB64] ?? [];
+  }, []);
+
+  // Persist the track log periodically and whenever the app is backgrounded.
+  //
+  // Writing on every fix would be a file write every ten seconds; writing only on
+  // exit would lose the session when Android kills the process. A minute is the
+  // compromise, and the visibility hook covers the common "user swiped away" case.
+  useEffect(() => {
+    if (phase !== "ready") return;
+
+    const save = () => {
+      void api.saveLocationHistory().catch(() => {
+        // Losing history is not worth interrupting the user over; the next save
+        // will try again.
+      });
+    };
+
+    const timer = window.setInterval(save, 60_000);
+    const onHidden = () => {
+      if (document.visibilityState === "hidden") save();
+    };
+    document.addEventListener("visibilitychange", onHidden);
+
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onHidden);
+      save();
+    };
+  }, [phase]);
 
   // -- rotation check --------------------------------------------------------
 
@@ -955,6 +1052,7 @@ export default function App() {
               trails={trails}
               selectedPubkey={selectedPubkey}
               onSelect={setSelectedPubkey}
+              onLoadHistory={loadHistory}
             />
           ) : null}
 

@@ -228,6 +228,28 @@ export interface TrailPoint {
   unixMs: number;
 }
 
+/** One recorded position in the month-long track log. */
+export interface TrackPoint {
+  lat: number;
+  lon: number;
+  unixMs: number;
+  speedMps: number;
+  activity: Activity;
+  /** `0` when the member's device did not report a battery level. */
+  batteryPct: number;
+  isCharging: boolean;
+}
+
+/** Track history for one or more members. */
+export interface HistoryResponse {
+  /** Points per member public key, oldest first. */
+  tracks: Record<string, TrackPoint[]>;
+  /** Oldest point the log still holds. */
+  oldestUnixMs: number | null;
+  /** Retention window, in days. */
+  retentionDays: number;
+}
+
 export interface RosterSnapshot {
   members: MemberView[];
   selfPubkey: string;
@@ -503,6 +525,21 @@ export interface LocationAccessResponse {
 export const locationAccess = () =>
   call<LocationAccessResponse>("location_access");
 
+/** Battery level and charging state, when the platform can report them. */
+export interface BatteryResponse {
+  /** `null` when the platform does not report a level. */
+  pct: number | null;
+  charging: boolean;
+}
+
+/**
+ * Read the device's battery state.
+ *
+ * Android answers through the native plugin; desktop reports `null` and the UI
+ * falls back to the webview's Battery Status API.
+ */
+export const batteryStatus = () => call<BatteryResponse>("battery_status");
+
 /**
  * Open the system screen where location access can be granted.
  *
@@ -563,7 +600,13 @@ export const joinGroup = (request: JoinGroupRequest) =>
 export const updateLocation = (
   lat: number,
   lon: number,
-  motion: { speedMps?: number; headingDeg?: number; accuracyM?: number } = {},
+  motion: {
+    speedMps?: number;
+    headingDeg?: number;
+    accuracyM?: number;
+    batteryPct?: number;
+    isCharging?: boolean;
+  } = {},
 ) =>
   call<LocationUpdateResponse>("update_location", {
     update: {
@@ -572,6 +615,8 @@ export const updateLocation = (
       speedMps: motion.speedMps ?? 0,
       headingDeg: motion.headingDeg ?? 0,
       accuracyM: motion.accuracyM ?? 0,
+      batteryPct: motion.batteryPct ?? 0,
+      isCharging: motion.isCharging ?? false,
     },
   });
 
@@ -586,6 +631,74 @@ export const refreshRateLimit = () => call<PollResponse>("refresh_rate_limit");
 export const rosterSnapshot = () => call<RosterSnapshot>("roster_snapshot");
 export const chatSnapshot = () => call<ChatSnapshot>("chat_snapshot");
 export const diagnostics = () => call<DiagnosticsResponse>("diagnostics");
+
+// -- Location history -------------------------------------------------------
+
+/**
+ * Track history for one member, or for everyone.
+ *
+ * Local only: this reads the on-device log, so it works offline and costs no
+ * requests. `hours` is clamped to the retention window by the core.
+ */
+export const locationHistory = (options: { pubkeyB64?: string; hours?: number } = {}) =>
+  call<HistoryResponse>("location_history", {
+    request: {
+      pubkeyB64: options.pubkeyB64 ?? null,
+      hours: options.hours ?? null,
+    },
+  });
+
+/** Persist the track log now. Returns true when a write happened. */
+export const saveLocationHistory = () => call<boolean>("save_location_history");
+
+/** Delete one member's history, or all of it when `pubkeyB64` is omitted. */
+export const clearLocationHistory = (pubkeyB64?: string) =>
+  call<void>("clear_location_history", { pubkeyB64: pubkeyB64 ?? null });
+
+// -- Native location fixes --------------------------------------------------
+
+/** A fix delivered by the Android foreground service. */
+export interface NativeFix {
+  lat: number;
+  lon: number;
+  accuracyM: number;
+  unixMs: number;
+  /** `-1` when the platform did not report a speed. */
+  speedMps: number;
+  /** `-1` when the platform did not report a heading. */
+  headingDeg: number;
+  /** `-1` when the platform did not report a battery level. */
+  batteryPct: number;
+  isCharging: boolean;
+}
+
+/**
+ * Subscribe to fixes from the Android foreground service.
+ *
+ * The service runs while the app is backgrounded, so this is what keeps a member's
+ * pin moving with the screen off. Returns an unsubscribe function; on desktop, or
+ * when the plugin is absent, it is a no-op.
+ */
+export async function onNativeFix(
+  handler: (fix: NativeFix) => void,
+): Promise<() => void> {
+  const internals = (globalThis as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  if (!internals) return () => {};
+  try {
+    const { addPluginListener } = await import("@tauri-apps/api/core");
+    const listener = await addPluginListener<NativeFix>(
+      "shadow720-location",
+      "locationFix",
+      handler,
+    );
+    return () => {
+      void listener.unregister();
+    };
+  } catch {
+    // No native plugin on this platform; the webview's own polling covers it.
+    return () => {};
+  }
+}
 
 // -- Chat -------------------------------------------------------------------
 

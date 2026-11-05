@@ -280,6 +280,12 @@ pub struct LocationUpdate {
     /// Horizontal accuracy radius in metres.
     #[serde(default)]
     pub accuracy_m: f32,
+    /// Battery percentage, or `0` when the platform cannot report it.
+    #[serde(default)]
+    pub battery_pct: u8,
+    /// True when the device is on external power.
+    #[serde(default)]
+    pub is_charging: bool,
 }
 
 /// Whether a submitted fix was published.
@@ -531,6 +537,54 @@ pub fn location_access(app: tauri::AppHandle) -> Result<LocationAccessResponse> 
         Ok(LocationAccessResponse {
             system_location_enabled: true,
             can_open_settings: cfg!(windows),
+        })
+    }
+}
+
+/// Battery level and charging state, when the platform can report them.
+///
+/// `pct` is `null` rather than `0` when unavailable, so the UI can distinguish
+/// "the phone is dead" from "this platform does not say".
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatteryResponse {
+    pub pct: Option<u8>,
+    pub charging: bool,
+}
+
+/// Read the device's battery state.
+///
+/// Android is asked through the location plugin, because the webview's Battery
+/// Status API is not present on every WebView build. Desktop falls back to the
+/// webview API, which the UI reads directly, so this reports "unknown" there.
+#[tauri::command]
+pub fn battery_status(app: tauri::AppHandle) -> Result<BatteryResponse> {
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager as _;
+
+        let handle = app
+            .try_state::<crate::keystore_android::LocationServiceHandle<tauri::Wry>>();
+        if let Some(handle) = handle {
+            if let Some((pct, charging)) = handle.inner().battery_status() {
+                return Ok(BatteryResponse {
+                    pct: Some(pct),
+                    charging,
+                });
+            }
+        }
+        return Ok(BatteryResponse {
+            pct: None,
+            charging: false,
+        });
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Ok(BatteryResponse {
+            pct: None,
+            charging: false,
         })
     }
 }
@@ -791,6 +845,15 @@ pub async fn unlock_vault(
         let identity = Identity::from_secret(stored.identity_secret);
         let group_state = GroupState::from_invite(&stored.invite, identity, stored.preferences.clone(), stored.is_host)?;
         group_state.install_roles(&stored.roles.iter().map(|role| (role.pubkey_b64.clone(), role.role.clone())).collect::<Vec<_>>());
+        // The track log is sealed with the group key, so it can only be opened
+        // once the group is known. A log that cannot be read is not fatal: the
+        // app starts with an empty history rather than refusing to launch.
+        match crate::history::TrackHistory::load(&request.vault_dir, &contents.group_key) {
+            Ok(history) => group_state.install_history(history),
+            Err(error) => {
+                eprintln!("warning: location history could not be loaded ({error}); starting empty");
+            }
+        }
         *state.group.write() = Some(Arc::new(group_state));
     }
     *state.vault.write() = Some(Arc::new(vault));
@@ -1619,6 +1682,11 @@ pub async fn update_location(
         accuracy_m: update.accuracy_m,
     };
 
+    // Battery is device state rather than position, so it is recorded even when
+    // the fix itself is not worth publishing: a member sitting still still wants
+    // their peers to see the phone is about to die.
+    group_state.set_battery(update.battery_pct, update.is_charging);
+
     let decision = group_state.consider_location(fix)?;
     if let Publish::No(reason) = decision {
         return Ok(LocationUpdateResponse {
@@ -1807,6 +1875,101 @@ pub async fn refresh_rate_limit(state: State<'_, AppState>) -> Result<PollRespon
         rate_limited: remaining.is_some(),
         halt_remaining_secs: remaining,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Location history
+// ---------------------------------------------------------------------------
+
+/// Request for a member's track history.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryRequest {
+    /// Member public key, Base64. Omit for every member.
+    #[serde(default)]
+    pub pubkey_b64: Option<String>,
+    /// How far back to look, in hours. Clamped to the retention window.
+    #[serde(default)]
+    pub hours: Option<u32>,
+}
+
+/// One member's track history.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryResponse {
+    /// Points per member public key, oldest first.
+    pub tracks: std::collections::HashMap<String, Vec<crate::history::TrackPoint>>,
+    /// Oldest point the log still holds, so the UI can say how far back it goes.
+    pub oldest_unix_ms: Option<i64>,
+    /// Retention window, in days.
+    pub retention_days: i64,
+}
+
+/// Track history for one member, or for everyone.
+///
+/// Local only: this reads the on-device log and never touches the network, so it
+/// works offline and costs no requests.
+#[tauri::command]
+pub fn location_history(
+    state: State<'_, AppState>,
+    request: HistoryRequest,
+) -> Result<HistoryResponse> {
+    let group_state = state.group()?;
+    let hours = request.hours.unwrap_or(24).clamp(1, crate::history::HISTORY_RETENTION_DAYS as u32 * 24);
+    let since_ms = now_unix_ms().saturating_sub(i64::from(hours) * 60 * 60 * 1_000);
+
+    let tracks = match request.pubkey_b64.as_deref() {
+        Some(pubkey) => {
+            let points = group_state.history_since(pubkey, since_ms);
+            if points.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                std::collections::HashMap::from([(pubkey.to_string(), points)])
+            }
+        }
+        None => group_state.history_snapshot(since_ms),
+    };
+
+    let oldest_unix_ms = tracks
+        .values()
+        .filter_map(|points| points.first().map(|point| point.unix_ms))
+        .min();
+
+    Ok(HistoryResponse {
+        tracks,
+        oldest_unix_ms,
+        retention_days: crate::history::HISTORY_RETENTION_DAYS,
+    })
+}
+
+/// Persist the track log now.
+///
+/// Called on a timer and when the app is backgrounded. Returns `true` when a
+/// write happened, so the caller can avoid pointless work.
+#[tauri::command]
+pub fn save_location_history(state: State<'_, AppState>) -> Result<bool> {
+    let group_state = state.group()?;
+    let vault = state.vault()?;
+    group_state.save_history(vault.dir())
+}
+
+/// Delete one member's history, or all of it.
+///
+/// Blocking a member calls this for that member: keeping a month of someone's
+/// movements after blocking them would defeat the point of blocking them.
+#[tauri::command]
+pub fn clear_location_history(
+    state: State<'_, AppState>,
+    pubkey_b64: Option<String>,
+) -> Result<()> {
+    let group_state = state.group()?;
+    match pubkey_b64 {
+        Some(pubkey) => group_state.forget_history(&pubkey),
+        None => group_state.history.write().clear(),
+    }
+    let vault = state.vault()?;
+    group_state.save_history(vault.dir())?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2085,12 +2248,21 @@ pub fn block_member(state: State<'_, AppState>, request: BlockRequest) -> Result
     }
     let mut preferences = group_state.preferences();
     if request.blocked {
-        preferences.blocked_pubkeys.insert(request.pubkey_b64);
+        preferences.blocked_pubkeys.insert(request.pubkey_b64.clone());
     } else {
         preferences.blocked_pubkeys.remove(&request.pubkey_b64);
     }
     state.vault()?.update_preferences(&preferences)?;
     group_state.set_preferences(preferences);
+
+    // Blocking someone should also stop this device from keeping a record of
+    // where they have been. Unblocking does not restore it: the log is gone.
+    if request.blocked {
+        group_state.forget_history(&request.pubkey_b64);
+        if let Ok(vault) = state.vault() {
+            let _ = group_state.save_history(vault.dir());
+        }
+    }
     Ok(())
 }
 

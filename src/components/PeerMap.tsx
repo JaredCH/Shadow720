@@ -23,12 +23,21 @@ interface PeerMapProps {
   basemap: "streets" | "dark";
   /** Zoom to use when there is no real position to centre on. */
   placeholderZoom?: number;
+  /**
+   * A member to fly to. Changing this value re-centres the map on that member
+   * and zooms in, which is what makes tapping a name in the roster useful.
+   */
+  focus?: { pubkeyB64: string; nonce: number } | null;
+  /** Extra track to draw under the pins, e.g. a selected member's history. */
+  historyTrack?: { points: TrailPoint[]; colour: string } | null;
 }
 
 /** Hit-test radius for tapping a pin, in CSS pixels. */
 const PIN_HIT_RADIUS_PX = 26;
 /** Zoom used before the user has interacted. */
 const DEFAULT_ZOOM = 14;
+/** Zoom used when flying to a member from the roster. */
+const FOCUS_ZOOM = 16;
 const MIN_ZOOM = 2;
 const MAX_ZOOM = 19;
 
@@ -49,6 +58,8 @@ export function PeerMap({
   onSelect,
   basemap,
   placeholderZoom,
+  focus,
+  historyTrack,
 }: PeerMapProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -81,6 +92,23 @@ export function PeerMap({
     state.centreLon = anchor.lon;
     renderRef.current();
   }, [anchor.lat, anchor.lon, followSelf]);
+
+  // Fly to a member when the roster asks for it.
+  //
+  // The `nonce` is what makes this fire on every tap: selecting the same member
+  // twice must re-centre the map, and a bare pubkey would not change.
+  useEffect(() => {
+    if (!focus) return;
+    const member = members.find((candidate) => candidate.pubkeyB64 === focus.pubkeyB64);
+    if (!member) return;
+    const state = stateRef.current;
+    state.centreLat = member.lat;
+    state.centreLon = member.lon;
+    // Zoom in far enough to see streets, but never zoom *out* on a user who had
+    // already zoomed in further.
+    state.zoom = Math.max(state.zoom, FOCUS_ZOOM);
+    renderRef.current();
+  }, [focus, members]);
 
   // The placeholder zoom is only a starting point. Once a real position arrives
   // the view has to zoom in, otherwise the first fix leaves the map at world scale.
@@ -201,6 +229,25 @@ export function PeerMap({
         }
       }
 
+      // A selected member's longer history sits under everything else, so the
+      // recent trail and the pin stay readable on top of it.
+      if (historyTrack && historyTrack.points.length >= 2) {
+        const points = historyTrack.points;
+        context.beginPath();
+        for (let index = 0; index < points.length; index += 1) {
+          const point = points[index];
+          if (!point) continue;
+          const screen = toScreen(point.lat, point.lon);
+          if (index === 0) context.moveTo(screen.x, screen.y);
+          else context.lineTo(screen.x, screen.y);
+        }
+        context.strokeStyle = withAlpha(historyTrack.colour, 0.28);
+        context.lineWidth = 2 * dpr;
+        context.lineCap = "round";
+        context.lineJoin = "round";
+        context.stroke();
+      }
+
       // Trails sit under the pins so a pin is never obscured by its own history.
       // Each segment fades with age, which is what makes the direction of travel
       // readable at a glance: the bright end is where the member is now.
@@ -225,6 +272,16 @@ export function PeerMap({
           context.lineWidth = baseWidth * (0.45 + progress * 0.55);
           context.lineCap = "round";
           context.stroke();
+        }
+
+        // A heading arrow on the newest segment, so a moving member's direction
+        // is readable without tracing the whole line.
+        const newest = points[points.length - 1];
+        const previous = points[points.length - 2];
+        if (newest && previous && member.speedMps > 1.0) {
+          const from = toScreen(previous.lat, previous.lon);
+          const to = toScreen(newest.lat, newest.lon);
+          drawArrow(context, from, to, member.avatarColor, dpr);
         }
       }
 
@@ -315,7 +372,7 @@ export function PeerMap({
       observer.disconnect();
       container.removeEventListener("wheel", onWheel);
     };
-  }, [members, selfFix, trails, selectedPubkey, basemap]);
+  }, [members, selfFix, trails, selectedPubkey, basemap, historyTrack]);
 
   // -- pointer interaction --------------------------------------------------
 
@@ -525,6 +582,44 @@ export function PeerMap({
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+/**
+ * Draw a small arrowhead at the end of a segment.
+ *
+ * A fading line shows where someone has been; the arrow shows which way they are
+ * going right now, which is the question a live map is usually asked.
+ */
+function drawArrow(
+  context: CanvasRenderingContext2D,
+  from: { x: number; y: number },
+  to: { x: number; y: number },
+  colour: string,
+  dpr: number,
+) {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  const length = Math.hypot(dx, dy);
+  // Too short to have a meaningful direction.
+  if (length < 6 * dpr) return;
+
+  const angle = Math.atan2(dy, dx);
+  const size = 7 * dpr;
+  const spread = Math.PI / 7;
+
+  context.beginPath();
+  context.moveTo(to.x, to.y);
+  context.lineTo(
+    to.x - size * Math.cos(angle - spread),
+    to.y - size * Math.sin(angle - spread),
+  );
+  context.lineTo(
+    to.x - size * Math.cos(angle + spread),
+    to.y - size * Math.sin(angle + spread),
+  );
+  context.closePath();
+  context.fillStyle = withAlpha(colour, 0.95);
+  context.fill();
 }
 
 /** Apply an alpha to a `#rrggbb` colour. */

@@ -246,6 +246,28 @@ impl<R: Runtime> LocationServiceHandle<R> {
             .map(|response| response.granted)
             .unwrap_or(false)
     }
+
+    /// Battery percentage and charging state, or `None` when unavailable.
+    ///
+    /// `pct` of `-1` from the platform means "not reported", which is mapped to
+    /// `None` so the UI can say "unknown" instead of showing a dead battery.
+    pub fn battery_status(&self) -> Option<(u8, bool)> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Response {
+            pct: i32,
+            charging: bool,
+        }
+
+        let response: Response = self
+            .handle
+            .run_mobile_plugin("batteryStatus", serde_json::json!({}))
+            .ok()?;
+        if !(0..=100).contains(&response.pct) {
+            return None;
+        }
+        Some((response.pct as u8, response.charging))
+    }
 }
 
 /// Register the keystore plugin and install it as the vault [`Keystore`].
